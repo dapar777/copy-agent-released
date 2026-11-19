@@ -48,8 +48,14 @@ inside another tool's folder is rejected. In a multi-root workspace the local fo
    The `## Help` section is mandatory: the tool shows it when the user types `/<name> --help`
    (no model turn needed), so keep it short, concrete and in the user's language.
 4. Scripts (optional): when the skill needs a repeatable mechanical step, add it as a file in
-   `<same folder>/scripts/<file>` (python/node/powershell), complete and runnable, with a usage comment at
-   the top; the tool lists such scripts to the model automatically when the skill is used.
+   `<same folder>/scripts/<file>`, complete and runnable, with a usage comment at the top; the tool
+   lists such scripts to the model automatically when the skill is used. Write it in the language the
+   "Environment" section of the prompt names under SCRIPTS: Python with the standard library only
+   unless that section says otherwise. A skill must work on every machine, so no PowerShell or batch
+   script unless the user asks for one. In the playbook call it as `python <script path>/<file>.py`.
+   When the step only fetches data the model then reads (a structure, a list, values), make it a tool
+   instead (/tool-creator): the model calls it with arguments and gets only the response, and the
+   skill's playbook just says which tool to call.
 5. Finish with `<done>` saying where the skill was saved, how to invoke it (`/<name> …`,
    `/<name> --help`) and that the skill list in the panel reloads automatically.
 

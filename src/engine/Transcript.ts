@@ -36,6 +36,33 @@ function firstTellingLine(output: string | undefined): string {
   return pick.slice(0, 160);
 }
 
+/**
+ * Kde se kolo zdrželo: celková doba vykonání a akce seskupené podle druhu, nejpomalejší jmenovitě.
+ * Prázdný text u kola, které proběhlo hned (pod půl sekundy).
+ */
+export function describeTimings(rec: { execMs?: number; timings?: { tool: string; target: string; ms: number; at?: number }[] }): string {
+  const timings = rec.timings ?? [];
+  const total = rec.execMs ?? timings.reduce((n, t) => n + t.ms, 0);
+  if (!timings.length || total < 500) return "";
+  const sec = (ms: number) => (ms < 950 ? `${Math.max(1, Math.round(ms / 100)) / 10} s`.replace(".", ",") : `${(ms / 1000).toFixed(1)} s`.replace(".", ","));
+  // souběžné akce téhož druhu se nesčítají: počítá se doba, po kterou aspoň jedna z nich běžela
+  const groups = new Map<string, { n: number; ms: number; end: number }>();
+  let clock = 0;
+  for (const t of timings) {
+    const g = groups.get(t.tool) ?? { n: 0, ms: 0, end: -1 };
+    const from = t.at ?? clock;
+    const to = from + t.ms;
+    g.n++;
+    g.ms += Math.max(0, to - Math.max(from, g.end));
+    g.end = Math.max(g.end, to);
+    groups.set(t.tool, g);
+    if (t.at === undefined) clock = to;
+  }
+  const byTool = [...groups.entries()].sort((a, b) => b[1].ms - a[1].ms).filter(([, g]) => g.ms >= 50).slice(0, 5).map(([tool, g]) => `${tool}${g.n > 1 ? ` ${g.n}×` : ""} ${sec(g.ms)}`);
+  const slow = [...timings].sort((a, b) => b.ms - a.ms).filter((t) => t.ms >= 1000).slice(0, 3).map((t) => `${t.tool}${t.target ? ` ${t.target.slice(0, 60)}` : ""} (${sec(t.ms)})`);
+  return `Akce trvaly ${sec(total)}: ${byTool.join(", ")}${slow.length ? `. Nejdéle: ${slow.join("; ")}` : ""}`;
+}
+
 export function describeResults(results: ResultLike[]): string {
   const bad = results.filter((r) => r.status !== "ok");
   const okList = results

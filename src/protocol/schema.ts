@@ -21,6 +21,10 @@ export interface ToolDef {
   readOnly?: boolean;
   /** zkrácený popis do instrukcí agenta (limit 8 000 znaků) */
   short?: string;
+  /** tělo je nepovinné: akce jde napsat samouzavírací i párová (<call … /> i <call …>{…}</call>) */
+  optionalBody?: boolean;
+  /** podpis pro model místo vygenerovaného z atributů */
+  signature?: string;
 }
 
 /** Název bloku v odpovědi modelu a bloku s výsledky od agenta. */
@@ -206,21 +210,57 @@ export const TOOLS: ToolDef[] = [
     example: "<plan>\n- [x] Prozkoumat validace\n- [ ] Přidat isValidEmail\n  - [ ] utils/email.ts\n  - [ ] testy\n</plan>",
   },
   {
+    name: "skill",
+    hasBody: false,
+    readOnly: true,
+    attrs: [
+      { name: "name", required: true, doc: "name from the list of available skills, without the slash" },
+      { name: "args", required: false, doc: "what the user would write after /name (options, scope)" },
+    ],
+    doc: "Get the instructions of an available skill when the task calls for it and they are not in the task yet. Follow them in your next reply.",
+    short: "get the instructions of a listed skill that the task needs",
+    example: '<skill name="review" args="src/auth.ts"/>',
+  },
+  {
+    name: "call",
+    hasBody: false,
+    optionalBody: true,
+    signature: '<call tool="name" arg="…"/> or <call tool="name">{JSON arguments}</call>',
+    attrs: [{ name: "tool", required: true, doc: 'name from the "Tools" list in the task' }],
+    bodyDoc: "optional JSON object with the arguments (for lists, objects and long text); otherwise arguments are attributes",
+    doc: 'Call a tool from the "Tools" list of the task. Arguments are attributes (text, numbers, true/false) or a JSON object in the body; they are checked against the tool\'s signature before it runs. You get only the tool\'s response (JSON or text), never its code.',
+    short: 'call a tool listed under "Tools": arguments as attributes or a JSON body; returns its response',
+    example: '<call tool="db-object" name="INVOICE_LINE"/>',
+  },
+  {
+    name: "change",
+    hasBody: true,
+    attrs: [
+      { name: "title", required: true, doc: "the change in a few words" },
+      { name: "risk", required: false, doc: "low (default) | medium | high" },
+      { name: "step", required: false, doc: "review step the change belongs to; the same text groups changes, steps are read in the order they first appear" },
+    ],
+    bodyDoc: "what changed and why, one to three sentences",
+    doc: "Describe for the reviewer the change made by the <write>, <edit>, <move> or <delete> right before it. Only when the task says CHANGE NOTES are ON.",
+    short: "reviewer's note on the change made right before it (only when CHANGE NOTES are ON)",
+    example: '<change title="Validace e-mailu" step="Formulář">Registrace odmítne adresu bez zavináče; dřív ji pustila na server.</change>',
+  },
+  {
     name: "suggest",
     hasBody: true,
     attrs: [
-      { name: "kind", required: true, doc: "skill | script | instructions | rule | hook | allow | setting | task | agent" },
+      { name: "kind", required: true, doc: "skill | tool | script | instructions | rule | hook | allow | setting | task | agent" },
       { name: "scope", required: false, doc: "project (default) or global (every project)" },
       { name: "title", required: true, doc: "short title shown to the user" },
       { name: "update", required: false, doc: 'modify an existing item: skill name, "rule N" or a hook match glob; the body is the complete replacement' },
-      { name: "lang", required: false, doc: 'with kind="script": python | node | bash | powershell | cmd (file extension)' },
+      { name: "lang", required: false, doc: 'with kind="script": the script language named under Environment (python unless told otherwise; also node | bash | powershell | cmd); it sets the file extension' },
       { name: "file", required: false, doc: 'with kind="script": file name, e.g. "release.py"' },
     ],
     bodyDoc:
-      "skill: markdown instructions reusable via /name (start with `# name`); script: COMPLETE source of a runnable script; instructions: lines for AGENTS.md; rule: one concise behaviour rule; " +
+      "skill: markdown instructions reusable via /name (start with `# name`); tool: the complete tool.json, then a line `--- run.py ---` and the complete script (title = tool name); script: COMPLETE source of a runnable script; instructions: lines for AGENTS.md; rule: one concise behaviour rule; " +
       'hook: JSON {"match": glob, "run": command}; allow: regex of commands safe to run without confirmation; setting: JSON {"key": "copyAgent.…", "value": …}; task: a follow-up for the plan; agent: feedback for the agent developer',
     doc: "Propose a reusable improvement for the user to approve (never applied automatically).",
-    short: "propose a reusable improvement (skill, script, rule, hook, allow, task…); user approves",
+    short: "propose a reusable improvement (skill, tool, script, rule, hook, allow, task…); user approves",
     example: '<suggest kind="rule" scope="global" title="Testy až po všech editech">Run tests once at the end of a turn, after all edits.</suggest>',
   },
   {
@@ -236,12 +276,13 @@ export const TOOLS: ToolDef[] = [
 
 export const TOOL_NAMES = new Set(TOOLS.map((t) => t.name));
 export const BODY_TOOLS = new Set(TOOLS.filter((t) => t.hasBody).map((t) => t.name));
+export const OPTIONAL_BODY_TOOLS = new Set(TOOLS.filter((t) => t.optionalBody).map((t) => t.name));
 export const READ_ONLY_TOOLS = new Set(TOOLS.filter((t) => t.readOnly).map((t) => t.name));
 export const REQUIRED_ATTRS: Record<string, string[]> = Object.fromEntries(TOOLS.map((t) => [t.name, t.attrs.filter((a) => a.required).map((a) => a.name)]));
 /** Akce, které samy nic nedělají (poznámky): blok složený jen z nich je „jen poznámka“. */
 export const REMARK_TOOLS = new Set(["status", "dialog", "plan", "done", "think"]);
 /** Akce, které nemají výsledek v <copy-results> (jen mění stav kola). */
-export const SILENT_TOOLS = new Set(["status", "ask", "done", "dialog", "think"]);
+export const SILENT_TOOLS = new Set(["status", "ask", "done", "dialog", "think", "change"]);
 
 /** Akce rozpoznaná v odpovědi modelu. */
 export interface Action {

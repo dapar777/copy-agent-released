@@ -2,7 +2,7 @@
   "name": "copy-agent",
   "displayName": "Copy Agent",
   "description": "Kódovací agent pro VS Code, který s LLM mluví přes schránku: prompt → chat (Copilot v Teams, claude.ai, ChatGPT…) → odpověď → akce. Bez API klíče.",
-  "version": "0.1.0",
+  "version": "0.4.0",
   "publisher": "dapar",
   "license": "MIT",
   "engines": {
@@ -127,6 +127,22 @@
       {
         "command": "copyAgent.review.openDiff",
         "title": "Copy Agent: Zobrazit diff souboru"
+      },
+      {
+        "command": "copyAgent.review.open",
+        "title": "Copy Agent: Otevřít změny v Review změn"
+      },
+      {
+        "command": "copyAgent.review.revert",
+        "title": "Copy Agent: Vrátit zamítnutý kus (volá Review změn)"
+      },
+      {
+        "command": "copyAgent.index.rebuild",
+        "title": "Copy Agent: Přestavět index workspace"
+      },
+      {
+        "command": "copyAgent.index.benchmark",
+        "title": "Copy Agent: Změřit rychlost hledání (s indexem a bez)"
       }
     ],
     "menus": {
@@ -149,6 +165,10 @@
         },
         {
           "command": "copyAgent.review.openDiff",
+          "when": "false"
+        },
+        {
+          "command": "copyAgent.review.revert",
           "when": "false"
         }
       ]
@@ -187,6 +207,13 @@
           "type": "number",
           "default": 80000,
           "description": "Maximální délka jedné zprávy pro chat. Delší prompt se rozdělí na části (PART i/n), které vložíte po sobě; model odpoví až na poslední. Výchozí 80 000 znaků (dělení prakticky nenastává); pokud chat dlouhou zprávu odmítne, snižte."
+        },
+        "copyAgent.prompt.runOutputMaxChars": {
+          "type": "number",
+          "default": 15000,
+          "minimum": 500,
+          "maximum": 200000,
+          "description": "Kolik znaků výstupu úspěšného příkazu (<run>) dostane model naráz; když je výstup delší, jde jeho konec. Snižte, když chcete kratší prompty (u buildu nebo testů stačí závěr); zvyšte, když příkazy vypisují data, která model potřebuje celá. Celý výstup je vždy v .copy-agent/out/ a model si ho umí dočíst. Delší výstup zvětšuje prompt: nad copyAgent.prompt.maxChars se prompt dělí na části. Platí od dalšího úkolu."
         },
         "copyAgent.prompt.resultMaxChars": {
           "type": "number",
@@ -361,6 +388,70 @@
             "**/*.key"
           ],
           "description": "Cesty (globy), do kterých agent nesmí zapisovat ani je mazat."
+        },
+        "copyAgent.review.tool": {
+          "type": "string",
+          "enum": [
+            "review-zmen",
+            "editor"
+          ],
+          "enumDescriptions": [
+            "Rozšíření Review změn (dapar.vscode-review): plán revize, schvalování po kusech, zamítnutí kusu. Když není nainstalované, použije se editor.",
+            "Vestavěné procházení v editoru: diff a CodeLens Přijmout / Zamítnout nad každou změnou."
+          ],
+          "default": "review-zmen",
+          "description": "Čím se procházejí změny, které agent udělal."
+        },
+        "copyAgent.review.describeChanges": {
+          "type": "boolean",
+          "default": false,
+          "description": "Model ke každé změně souboru rovnou připíše popis pro review (název, proč, riziko, krok plánu). Review změn je pak ukáže jako plán revize s popisy; bez toho se změny procházejí po blocích diffu bez popisů. Popisy prodlužují odpověď modelu."
+        },
+        "copyAgent.run.powershellNoProfile": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Když příkaz z `<run>` spouští PowerShell (`powershell` nebo `pwsh`) bez `-NoProfile`, Copy Agent mu přidá `-NoProfile -NonInteractive`. PowerShell pak nenačítá profil uživatele a startuje znatelně rychleji. Vypněte, pokud vaše skripty profil potřebují."
+        },
+        "copyAgent.index.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Index workspace: tabulka souborů, otisk obsahu a definice (procedury, funkce, třídy) v paměti. Hledání (`<grep>`), výpisy souborů, výběr kontextu a svazky pak nečtou disk při každém dotazu; hledání přečte jen soubory, které hledaný text mohou obsahovat. Staví se na pozadí po startu a ukládá se do úložiště rozšíření, takže po restartu se čtou jen změněné soubory. Vypnuto = soubory se čtou z disku jako dřív (a hledání prohledá jen prvních 5 000 souborů)."
+        },
+        "copyAgent.index.cacheMb": {
+          "type": "number",
+          "default": 96,
+          "minimum": 8,
+          "maximum": 2048,
+          "description": "Kolik MB obsahu souborů smí index držet v paměti (bajty souborů, mimo haldu JavaScriptu). Soubory nad strop se při prohledávání všeho čtou z disku."
+        },
+        "copyAgent.index.exclude": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Další názvy složek a souborů, které index vynechá (k výchozím: node_modules, .git, .svn, dist, build, bin, obj… a položkám z .gitignore a files.exclude). Jen názvy nebo cesty od kořene, bez hvězdiček."
+        },
+        "copyAgent.tools.builtin": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Vestavěné nástroje nad indexem, které model volá akcí `<call>` a které odpoví hned, bez spouštění skriptu: `symbols` (kde je co definováno), `code` (tělo definice podle jména), `usages` (kde se identifikátor používá), `outline` (struktura souborů), `files` (soubory podle názvu). Vyžadují zapnutý index."
+        },
+        "copyAgent.tools.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Nástroje: model volá akcí `<call>` funkce ze složek `.copy-agent/tools/<název>/` (projekt) a `~/.copy-agent/tools/<název>/` (globální). Každý nástroj má `tool.json` (popis, argumenty jako JSON Schema, příkaz) a skript; model dostane jen jeho odpověď. Nový nástroj: `/tool-creator`. Vypnuto = model nástroje nevidí."
+        },
+        "copyAgent.scripts.language": {
+          "type": "string",
+          "enum": ["python", "node", "powershell", "bash", "auto"],
+          "enumDescriptions": [
+            "Python jen se standardní knihovnou (výchozí)",
+            "Node.js jen s vestavěnými moduly",
+            "PowerShell",
+            "Bash",
+            "Volbu nechat na modelu"
+          ],
+          "default": "python",
+          "description": "V čem má agent psát skripty: pro úkol, pro skripty skillů i pro návrhy automatizace. Model se v promptu dozví, jaký shell příkazy pouští a jestli je tu Python a Node.js; když zvolený jazyk nainstalovaný není, použije náhradní. Jednorázové příkazy v <run> se tím nemění."
         },
         "copyAgent.review.requireApproval": {
           "type": "boolean",

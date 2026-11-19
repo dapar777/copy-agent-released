@@ -98,6 +98,9 @@ export function stripAnsi(s: string): string {
   return s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
 }
 
+/** Přípony souborů, které nejsou text (nečtou se do svazků, indexu ani při hledání). */
+export const BINARY_EXT = /\.(png|jpe?g|gif|bmp|ico|webp|svgz|pdf|zip|gz|tgz|7z|rar|jar|exe|dll|so|dylib|bin|dat|db|sqlite|woff2?|ttf|otf|eot|mp[34]|wav|ogg|mov|avi|lock|vsix|class|pyc|pyo|o|obj|lib|a|pdb|xlsx?|xlsm|docx?|pptx?|msi|iso|dmp)$/i;
+
 export const DEFAULT_EXCLUDES = [
   "node_modules", ".git", "dist", "out", "build", ".copy-agent", ".whisper", "coverage", ".next", "target",
   "__pycache__", ".venv", "venv", ".pytest_cache", ".mypy_cache", "bin", "obj", ".idea",
@@ -134,7 +137,8 @@ export function truncate(text: string, max: number, fullPath?: string): { text: 
 }
 
 /** Nad tuto délku se výstup úspěšného příkazu posílá jen jako konec. */
-export const OK_RUN_OUTPUT_MAX = 3000;
+/** Výchozí počet znaků z konce výstupu úspěšného příkazu pro model (copyAgent.prompt.runOutputMaxChars). */
+export const OK_RUN_OUTPUT_MAX = 15000;
 
 /** Úspěšný příkaz s dlouhým výstupem: model potřebuje zpravidla jen závěr. */
 export function compactOkOutput(text: string, fullPath?: string, max = OK_RUN_OUTPUT_MAX): string {

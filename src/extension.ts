@@ -2,7 +2,8 @@ import * as vscode from "vscode";
 import { ClipboardBridge } from "./clipboard/ClipboardBridge";
 import { Controller } from "./engine/Controller";
 import { Session } from "./engine/Session";
-import { ReviewManager } from "./review/ReviewManager";
+import { IndexService } from "./index/IndexService";
+import { ReviewManager, type RevertRequest } from "./review/ReviewManager";
 import { ApprovalService } from "./safety/Approvals";
 import { Checkpoint } from "./safety/Checkpoint";
 import { SidebarView } from "./ui/SidebarView";
@@ -16,6 +17,11 @@ export function activate(context: vscode.ExtensionContext): void {
   const approvals = new ApprovalService();
   const controller = new Controller(session, review, clipboard, checkpoint, approvals);
   controller.builtinSkillsDir = vscode.Uri.joinPath(context.extensionUri, "skills").fsPath;
+  controller.globalState = context.globalState;
+  // index workspace se staví hned po startu na pozadí, ať je první úkol už rychlý
+  const indexService = new IndexService(context.storageUri?.fsPath, (line) => controller.logIndex(line));
+  controller.indexService = indexService;
+  void indexService.index;
   controller.reloadSkills();
   const sidebar = new SidebarView(controller, context.extensionUri);
 
@@ -61,6 +67,13 @@ export function activate(context: vscode.ExtensionContext): void {
     controller,
     approvals,
     status,
+    indexService,
+    cmd("copyAgent.index.benchmark", () => controller.benchmark()),
+    cmd("copyAgent.index.rebuild", () => {
+      indexService.reset(true);
+      void indexService.index;
+      void vscode.window.setStatusBarMessage("$(sync) Copy Agent: index workspace se staví znovu", 4000);
+    }),
     vscode.window.registerWebviewViewProvider(SidebarView.viewId, sidebar, { webviewOptions: { retainContextWhenHidden: true } }),
 
     cmd("copyAgent.newTask", async () => {
@@ -90,8 +103,16 @@ export function activate(context: vscode.ExtensionContext): void {
     cmd("copyAgent.toggleAutoApprove", () => approvals.setMode(approvals.mode === "auto" ? "ask" : "auto")),
 
     cmd("copyAgent.review.next", async () => {
+      if (!review.hasPending) return void vscode.window.showInformationMessage("Žádné změny ke schválení.");
+      // Výchozí nástroj je rozšíření Review změn; bez něj (nebo podle nastavení) se změny procházejí v editoru.
+      if (await review.openInTool()) return;
       if (!(await review.goToNext())) void vscode.window.showInformationMessage("Žádné změny ke schválení.");
     }),
+    cmd("copyAgent.review.open", async () => {
+      if (!review.hasPending) return void vscode.window.showInformationMessage("Žádné změny ke schválení.");
+      if (!(await review.openInTool())) void vscode.window.showWarningMessage("Rozšíření Review změn (dapar.vscode-review) není nainstalované nebo je v nastavení copyAgent.review.tool vybraný editor.");
+    }),
+    cmd("copyAgent.review.revert", (req: RevertRequest) => review.revert(req)),
     cmd("copyAgent.review.acceptHunk", async (path: string, i: number) => {
       await review.accept(path, i);
       await review.goToNext({ path, index: i });
@@ -104,7 +125,9 @@ export function activate(context: vscode.ExtensionContext): void {
     cmd("copyAgent.review.rejectFile", (path: string) => review.reject(path)),
     cmd("copyAgent.review.acceptAll", () => review.acceptAll()),
     cmd("copyAgent.review.rejectAll", () => review.rejectAll()),
-    cmd("copyAgent.review.openDiff", (path: string) => review.openDiff(path)),
+    cmd("copyAgent.review.openDiff", async (path: string) => {
+      if (!(await review.openInTool(path))) await review.openDiff(path);
+    }),
   );
 
   void controller.resume();

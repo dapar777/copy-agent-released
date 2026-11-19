@@ -20,6 +20,9 @@ export const BUILTIN_COMMANDS: SlashCommand[] = [
   { name: "new", kind: "builtin", description: "Vyčistit panel a začít znovu (ukončí běžící úkol)" },
   { name: "status", kind: "builtin", description: "Stav sezení: kolo, režim, čekání, plán" },
   { name: "skills", kind: "builtin", description: "Seznam dostupných skillů a odkud jsou" },
+  { name: "tools", kind: "builtin", description: "Seznam nástrojů, které model volá akcí <call>, a jejich stav" },
+  { name: "index", kind: "builtin", description: "Stav indexu workspace (soubory, paměť, čtení z disku)" },
+  { name: "bench", kind: "builtin", description: "Změřit rychlost výpisu souborů a hledání na tomto workspace, s indexem a bez" },
   { name: "instructions", kind: "builtin", description: "Zkopírovat instrukce pro agenta v Copilotu (Teams) do schránky" },
   { name: "help", kind: "builtin", description: "Nápověda k příkazům a stavům" },
 ];

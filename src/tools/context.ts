@@ -78,12 +78,14 @@ export async function pathsFrom(host: Host, text: string, files: string[]): Prom
 const TEXT_EXT = /\.(ts|tsx|js|jsx|mjs|cjs|py|rb|go|rs|java|kt|cs|cpp|cc|c|h|hpp|php|swift|scala|sql|sh|ps1|bat|cmd|md|markdown|txt|json|jsonc|yaml|yml|toml|xml|html|css|scss|less|vue|svelte|ini|cfg|conf|env|csv|rst|tex)$/i;
 
 export async function collectAutoContext(host: Host, task: string, active: { path: string } | undefined, opts: AutoContextOptions): Promise<AutoPick[]> {
-  const files = (await host.listFiles("**/*", 6000)).filter((f) => TEXT_EXT.test(f));
+  const index = host.index;
+  const files = (await host.listFiles("**/*", index ? 500_000 : 6000)).filter((f) => TEXT_EXT.test(f));
+  const fileSet = new Set(files);
   const exclude = new Set([...(opts.exclude ?? []), ...parseRefs(task).map((r) => r.path)]);
   const maxFiles = opts.maxFiles ?? 6;
   const picks: { path: string; score: number; reason: string; hits: number[] }[] = [];
   const add = (p: string, score: number, reason: string, hits: number[] = []) => {
-    if (exclude.has(p) || !files.includes(p)) return;
+    if (exclude.has(p) || !fileSet.has(p)) return;
     const ex = picks.find((x) => x.path === p);
     if (ex) {
       ex.score += score;
@@ -92,7 +94,7 @@ export async function collectAutoContext(host: Host, task: string, active: { pat
     } else picks.push({ path: p, score, reason, hits });
   };
   for (const p of await pathsFrom(host, task, files)) add(p, 100, "mentioned in the task");
-  if (active?.path && files.includes(active.path)) add(active.path, 40, "open in the editor");
+  if (active?.path && fileSet.has(active.path)) add(active.path, 40, "open in the editor");
 
   const idents = identifiersFrom(task);
   if (idents.length) {
@@ -102,11 +104,20 @@ export async function collectAutoContext(host: Host, task: string, active: { pat
       const base = (f.split("/").pop() ?? f).replace(/\.[^.]+$/, "").toLowerCase();
       for (const w of idents) if (base === w.toLowerCase() || base.replace(/[-_]/g, "") === w.toLowerCase().replace(/[-_]/g, "")) add(f, 60, `name matches "${w}"`);
     }
-    // obsah: skenujeme po dávkách, soubory do 200 kB
-    const scan = files.slice(0, 2500);
+    // obsah: s indexem jen soubory, které některý identifikátor podle otisku mohou obsahovat (nejvýš 600 na
+    // identifikátor, ať běžné slovo nezahltí výběr); bez indexu prvních 2500 souborů
+    let scan: string[];
+    if (index) {
+      const picked = new Set<string>();
+      for (const w of idents) {
+        const cands = w.length >= 3 ? index.candidates([[w]], files) : [];
+        for (const f of cands.slice(0, 600)) picked.add(f);
+      }
+      scan = files.filter((f) => picked.has(f)).slice(0, 2500);
+    } else scan = files.slice(0, 2500);
     for (let i = 0; i < scan.length; i += 24) {
       const batch = scan.slice(i, i + 24);
-      const texts = await Promise.all(batch.map((f) => host.readFile(f).catch(() => "")));
+      const texts = await Promise.all(batch.map((f) => (index ? index.text(f).then((t) => t ?? "") : host.readFile(f)).catch(() => "")));
       batch.forEach((f, k) => {
         const text = texts[k];
         if (!text || text.length > 200_000 || text.includes("\u0000")) return;

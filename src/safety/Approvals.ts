@@ -2,13 +2,15 @@ import * as vscode from "vscode";
 import { nowId } from "../protocol/text";
 import { cfg, CONFIG } from "../util";
 
-export type ApprovalKind = "command" | "delete";
+export type ApprovalKind = "command" | "delete" | "tool";
 
 export interface ApprovalRequest {
   id: string;
   kind: ApprovalKind;
   text: string;
   cwd?: string;
+  /** soubor, který jde z karty otevřít (u nástroje jeho tool.json) */
+  path?: string;
   at: string;
   decision?: "allow" | "deny" | "auto";
 }
@@ -36,9 +38,10 @@ export class ApprovalService implements vscode.Disposable {
     return [...this.pending.values()].map((p) => p.req);
   }
 
-  request(kind: ApprovalKind, text: string, cwd?: string): Promise<boolean> {
-    const req: ApprovalRequest = { id: nowId(), kind, text, cwd, at: new Date().toISOString() };
-    if (kind === "command" && this.mode === "auto") {
+  request(kind: ApprovalKind, text: string, cwd?: string, path?: string): Promise<boolean> {
+    const req: ApprovalRequest = { id: nowId(), kind, text, cwd, path, at: new Date().toISOString() };
+    // režim auto povoluje příkazy i nástroje (spouštějí kód stejně jako příkaz); mazání se ptá vždy
+    if ((kind === "command" || kind === "tool") && this.mode === "auto") {
       req.decision = "auto";
       this.history.push(req);
       this.emitter.fire();
@@ -70,7 +73,7 @@ export class ApprovalService implements vscode.Disposable {
 
   async switchToAuto(): Promise<void> {
     await this.setMode("auto");
-    for (const [id, p] of [...this.pending]) if (p.req.kind === "command") await this.decide(id, true);
+    for (const [id, p] of [...this.pending]) if (p.req.kind === "command" || p.req.kind === "tool") await this.decide(id, true);
   }
 
   async decide(id: string, allow: boolean, alwaysPattern?: string): Promise<void> {

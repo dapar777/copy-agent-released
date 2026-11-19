@@ -89,18 +89,96 @@ a `AGENTS.md` do `.gitignore` a do `svn:ignore` každé složky pod správou ver
 src/
 ├── extension.ts            aktivace, příkazy, stavový řádek
 ├── protocol/               čistá vrstva (testovaná): schema, parser, prompt, edit, section, diff, refs, slash, detect, roots, text
-├── tools/                  nástroje nad Hostem: fs, grep, run, bundle, check, context (auto-kontext), refs, runner (souběžné čtení)
+├── tools/                  nástroje nad Hostem: fs, grep, run, bundle, check, context (auto-kontext), refs, runner (souběžné čtení), scripttools (<call>), runtime
 ├── engine/                 TurnEngine (smyčka kola bez UI), Controller (VS Code orchestrace), Session, SessionData, Transcript
 ├── host/                   Host rozhraní, NodeHost (CLI/testy), VsCodeHost, spawn, screenshot
 ├── clipboard/              ClipboardBridge, ClipboardOwner (detekce vložení), FileReplyWatcher
-├── review/                 ReviewManager (baseline, hunky, CodeLens, dekorace)
+├── review/                 ReviewManager (baseline, hunky, CodeLens, dekorace, sada pro Review změn), changeset (čistá logika sady a popisů)
 ├── safety/                 Policy, Approvals, Checkpoint
+├── index/                  WorkspaceIndex (tabulka souborů, otisky, symboly, mezipaměť), tokens, symbols, builtin (vestavěné nástroje), IndexService (VS Code)
 ├── skills/                 Skills (+ skripty), Hooks, GlobalConfig (~/.copy-agent)
 ├── ui/                     SidebarView (webview)
 └── cli/                    harness (headless), gen-instructions (instrukce pro Copilot agenta)
 ```
 
 Žádné runtime závislosti; jen VS Code API a Node. Balení přes esbuild, testy vitest (`test/`).
+
+## Rychlost: index workspace
+
+Cíl: akce na straně VS Code nemají být tím, na co se čeká. Měření na 20 002 souborech (155 MB textu,
+Linux, teplá disková cache; `0.3.1` → s indexem):
+
+| Akce | dřív | s indexem |
+|---|---|---|
+| výpis všech souborů, `glob`, `ls` | 400–490 ms | 5–11 ms |
+| `grep` vzácného identifikátoru | 850–1000 ms, jen prvních 5 000 souborů | 14–22 ms, všech 20 002 |
+| `grep` výrazem bez pevného textu | 716 ms za 5 000 souborů | 1 735 ms za 20 002 souborů |
+| blok: 6× grep, 2× read, glob, ls | 4 331 ms | 361 ms |
+| kontext nového úkolu (strom, výběr souborů) | 613 ms | 120 ms |
+| kontrola 6 zapsaných pythonových souborů | 6 spuštění Pythonu | 1 spuštění |
+
+První sestavení indexu trvalo 5 s (na pozadí), další start s uloženým indexem 0,44 s bez čtení souborů.
+Paměť: otisky 14 MB, mezipaměť obsahu do stropu (výchozí 96 MB), soubor indexu 31 MB. Na Windows
+měřeno není; tam si to změří příkaz `/bench` přímo na workspace uživatele.
+
+- **`src/index/WorkspaceIndex.ts`** (čistý Node): tabulka souborů (velikost, čas změny), u textových
+  souborů otisk a symboly, mezipaměť bajtů souborů (LRU se stropem; při čtení všeho se neuvolňuje to,
+  co bylo použito v tomtéž průchodu). Soubory nad 2 MB a binární se nečtou; text nad 512 tisíc znaků se
+  neprohledává (stejná hranice jako dřív).
+- **Otisk** (`tokens.ts`): Bloomův filtr trojic sousedních znaků v řádcích, po sjednocení velikosti
+  ASCII písmen a nahrazení znaků mimo ASCII jedním zástupným. Z regulárního výrazu se vezmou doslovné
+  kusy, které ve shodě být musí (větve `a|b` zvlášť; skupiny, třídy, nepovinné znaky kus ukončí). Soubor
+  bez některé trojice kusu shodu mít nemůže. Výraz bez použitelného kusu = prohledat vše. Otisk smí říct
+  „možná“ zbytečně, nikdy „ne“ chybně; hlídá to test, který porovnává výstup s hledáním hrubou silou.
+- **Symboly** (`symbols.ts`): definice po řádcích regulárními výrazy podle přípony (PL/SQL: balíky,
+  procedury, funkce, typy, tabulky…; TS/JS/Java/C#/Go/Rust: třídy, metody, funkce; Python; nadpisy
+  Markdownu). Slouží nástrojům `symbols`, `code`, `usages`, `outline`.
+- **Aktuálnost**: `touch(cesta)` od sledování souborů a od vlastních zápisů hostitele; po `<run>` ve
+  VS Code `settle()` (další dotaz počká 300 ms na události) a průchod disku na pozadí; `markStale()`
+  (další dotaz si disk projde sám) u hostitele bez sledování souborů. Neuložené texty z editoru mají
+  přednost před diskem a prohledají se vždy. `<read>`, `<write>` a `<edit>` čtou soubor vždy z disku.
+- **Uložení**: `index.bin` v úložišti rozšíření pro workspace (tabulka, otisky, symboly; obsah ne). Po
+  startu se načte a srovná s diskem podle velikosti a času změny.
+- **`IndexService`** (VS Code): jedna instance pro složky workspace, sledování souborů, nastavení
+  `copyAgent.index.*`, příkazy přestavění a měření.
+- **Další zrychlení v téže změně**: kontrola zapsaných souborů až na konci bloku, každý soubor jednou
+  v konečném stavu, souběžně a Python jedním procesem; čekání na diagnostiku editoru podle událostí
+  (konec 300 ms po poslední změně, 800 ms když se žádný jazykový server neozve, dřív pevných 1 200 ms);
+  git checkpoint jen u bloku, který může něco změnit; změny ke schválení se pro panel nečtou z disku při
+  každém překreslení; `-NoProfile` pro PowerShell; rychlejší rozpoznání kódování (nativní kontrola UTF-8).
+- **Co zůstává pomalé**: hledání výrazem bez pevného textu čte všechno (rychleji než dřív na soubor, ale
+  všech souborů); příkazy v `<run>` trvají, kolik trvají (každé spuštění PowerShellu je nový proces).
+
+## Nástroje (`<call>`)
+
+Mezi skillem (text s postupem, skript si model pouští přes `<run>` a čte jeho výstup) a MCP (Copilot
+v Teams ho připojit neumí). Nástroj je funkce se specifikací; Copy Agent je pro model v Teams jeho
+„MCP klient“: model napíše `<call>`, Copy Agent nástroj spustí a vrátí odpověď.
+
+- **Složka** `~/.copy-agent/tools/<název>/` (globální) nebo `.copy-agent/tools/<název>/` (projekt, má
+  přednost): `tool.json` + skript. `tool.json`: `name` (= složka), `description`, `inputSchema` (JSON
+  Schema jako u nástrojů MCP: `type`, `description`, `enum`, `default`, `pattern`, `minimum`, `maximum`,
+  `items`, `required`), `output`, `run` (příkaz ve složce nástroje; `python …` se přepíše na příkaz,
+  kterým tu Python opravdu jde spustit), `readOnly`, `timeout` (s, výchozí 30), `maxChars` (výchozí
+  20 000), `examples`. Neplatný `tool.json` se modelu nenabízí; panel ukáže chyby.
+- **Smlouva skriptu**: na stdin jeden JSON `{"args", "tool", "workspace", "roots"}`, prostředí navíc
+  `COPY_AGENT_WORKSPACE`, `COPY_AGENT_TOOL_DIR`, `COPY_AGENT_ROOTS`; odpověď na stdout (JSON se zhustí na
+  řádek, jinak text); chyba = nenulový návratový kód a text na stderr. Každé volání je nový proces.
+- **Volání**: `<call tool="x" a="1"/>` (atributy se převedou podle schématu na čísla, true/false,
+  seznamy) nebo `<call tool="x">{JSON}</call>`. Argumenty se ověří před spuštěním; chyba se vrátí
+  s podpisem. Výsledek `<result of="call" tool="x" …krátké argumenty… status ms>`. Čtecí nástroje běží
+  souběžně s ostatními čtecími akcemi. Odpověď nad `maxChars` jde do `.copy-agent/out/call-…`, model
+  dostane začátek (celé řádky) a cestu pro `<read lines>`.
+- **Důvěra** (`ToolGate`): otisk obsahu složky (bez `data/`, `__pycache__`, `.pyc`) uložený v globalState
+  rozšíření. Nový nebo změněný nástroj se spustí až po schválení, i globální: model smí zapisovat do
+  `~/.copy-agent`, takže by jinak mohl přepsat důvěryhodný nástroj a spustit libovolný kód bez dotazu.
+  Nástroj bez `readOnly: true` se schvaluje při každém volání. Režim auto povoluje i nástroje.
+- **Po zápisu**: když blok změnil složku nástroje a nástroj nevolal, Copy Agent ho po bloku vyzkouší na
+  příkladech (nejvýš 3, jen čtecí nástroj); chybný `tool.json` vrátí jako chybu, takže `<done>` neprojde.
+- **Vznik**: skill `/tool-creator`, návrh `<suggest kind="tool">` (tělo = tool.json, pak `--- run.py ---`
+  a skript), nebo ručně.
+- Logika je v `src/tools/scripttools.ts` bez `vscode` (testy `test/scripttools.test.ts`); schvalovací
+  karta, `/tools` a list v panelu jsou v `Controller` a `SidebarView`.
 
 ## 8. Známá omezení
 
@@ -109,3 +187,22 @@ src/
 - Soubory do schránky a detekce vložení jsou jen na Windows; jinde se příloha přikládá ručně
   z `.copy-agent/out/` a další krok se spouští tlačítkem.
 - Screenshoty jen na Windows.
+
+## Změny agenta v rozšíření Review změn
+
+Výchozí nástroj na procházení změn je rozšíření Review změn (`dapar.vscode-review`); vestavěné
+procházení v editoru zůstává jako záloha. Rozšíření se neváží na sebe kódem, jen souborem a příkazy:
+
+- **Sada změn.** `ReviewManager` po každé změně zapíše čekající změny do `.copy-agent/review/`:
+  `sada.json` (soubory absolutní cestou, jejich stav, příkazy pro přijetí a zamítnutí) a `base/`
+  se zněním souborů před změnou. Review změn nad sadou počítá diff samo, bez správy verzí, a svoje
+  schválení ukládá do téže složky (`uzivatel.json`). Vyřízená sada schválení i popisy maže.
+- **Příkazy.** `reviewZmen.sada(soubor, cesta?)` otevře review nad sadou, `reviewZmen.stavSady(soubor)`
+  vrátí kroky plánu a soubory s počty schválených kusů pro přehled v panelu. Opačným směrem volá
+  Review změn `copyAgent.review.acceptAll` a `copyAgent.review.revert({ soubor, cely, upravy })`:
+  zamítnutý kus vrací Copy Agent, protože zná kódování souboru a hlásí zamítnutí modelu.
+- **Popisy od modelu.** S volbou `review.describeChanges` dostane úkol pokyn psát za každou změnu
+  `<change>`. `ToolRunner` popis přiřadí k poslední změně souboru v bloku (znění před akcí a po ní),
+  `changeset.ts` z popisů spočítá rozsahy řádků v aktuálním znění (pozdější akce je posouvají nebo
+  přepisují) a zapíše `agent.json` vedle sady: kusy, rizika a kroky plánu podle `step`. Pokyn je
+  jen v úkolu; instrukce agenta v Copilotu znají akci, ale ne povinnost ji psát.

@@ -101,3 +101,52 @@ describe("file tools and auto-context", () => {
     expect(picks.find((p) => p.path === "src/UserService.ts")?.mode).toBe("full");
   });
 });
+
+describe("shell commands", () => {
+  it("starts PowerShell without the user profile, wherever it is called", async () => {
+    const { tunePowerShell } = await import("../src/tools/run");
+    const cases: [string, string][] = [
+      ["powershell -File x.ps1", "powershell -NoProfile -NonInteractive -File x.ps1"],
+      ["powershell.exe -ExecutionPolicy Bypass -File a.ps1 -Arg 1", "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File a.ps1 -Arg 1"],
+      ['pwsh -Command "Get-ChildItem"', 'pwsh -NoProfile -NonInteractive -Command "Get-ChildItem"'],
+      ['cd src && powershell -Command "Get-Date"', 'cd src && powershell -NoProfile -NonInteractive -Command "Get-Date"'],
+      ['svn status | powershell -Command "$input"', 'svn status | powershell -NoProfile -NonInteractive -Command "$input"'],
+      ['"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -File x.ps1', '"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -NoProfile -NonInteractive -File x.ps1'],
+      // už nastavené nebo vůbec ne volání PowerShellu: beze změny
+      ["powershell -NoProfile -File x.ps1", "powershell -NoProfile -File x.ps1"],
+      ["pwsh -nop -c x", "pwsh -nop -c x"],
+      ["echo powershell is slow", "echo powershell is slow"],
+      ["python run.py --shell powershell", "python run.py --shell powershell"],
+      ["npm test", "npm test"],
+    ];
+    for (const [input, want] of cases) expect(tunePowerShell(input), input).toBe(want);
+  });
+
+  it("tells the model when a shell command did what an action does instantly", async () => {
+    const { shellSearchHint } = await import("../src/tools/run");
+    expect(shellSearchHint('powershell -Command "Get-ChildItem -Recurse -Filter *.sql | Select-String vystav_fakturu"')).toMatch(/<grep pattern=…>.*<glob>\/<ls>/);
+    expect(shellSearchHint("findstr /s /i vystav_fakturu *.sql")).toMatch(/<grep/);
+    expect(shellSearchHint("type db\\pkg_faktury.sql")).toMatch(/<read path=…/);
+    expect(shellSearchHint("dir /s /b *.pkb")).toMatch(/<glob>/);
+    expect(shellSearchHint("npm test")).toBe("");
+    expect(shellSearchHint("svn status")).toBe("");
+    expect(shellSearchHint("python tools/build.py")).toBe("");
+  });
+
+  it("summarises where a turn spent its time", async () => {
+    const { describeTimings } = await import("../src/engine/Transcript");
+    expect(describeTimings({ execMs: 120, timings: [{ tool: "grep", target: "x", ms: 100 }] })).toBe("");
+    expect(
+      describeTimings({
+        execMs: 4300,
+        timings: [
+          { tool: "grep", target: "a", ms: 60 },
+          { tool: "grep", target: "b", ms: 40 },
+          { tool: "run", target: "powershell -File build.ps1", ms: 2100 },
+          { tool: "run", target: "svn status", ms: 1700 },
+          { tool: "read", target: "a.sql", ms: 3 },
+        ],
+      }),
+    ).toBe("Akce trvaly 4,3 s: run 2× 3,8 s, grep 2× 0,1 s. Nejdéle: run powershell -File build.ps1 (2,1 s); run svn status (1,7 s)");
+  });
+});

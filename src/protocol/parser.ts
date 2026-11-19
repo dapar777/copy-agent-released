@@ -1,4 +1,4 @@
-import { Action, BLOCK, BODY_TOOLS, ParsedReply, REQUIRED_ATTRS, RESULTS, TOOL_NAMES } from "./schema";
+import { Action, BLOCK, BODY_TOOLS, OPTIONAL_BODY_TOOLS, ParsedReply, REQUIRED_ATTRS, RESULTS, TOOL_NAMES } from "./schema";
 import { decodeEntities } from "./text";
 
 /**
@@ -110,7 +110,21 @@ function scanBlock(src: string, start: number): Scan {
     }
     const attrs = parseAttrs(rawAttrs);
     const action: Action = { tool: name, attrs, index: index++ };
-    if (BODY_TOOLS.has(name)) {
+    if (OPTIONAL_BODY_TOOLS.has(name) && !selfClose) {
+      // <call tool="x">{…}</call>: tělo s argumenty. Neuzavřený tag v uzavřeném bloku je samouzavírací
+      // (model napsal <call tool="x" a="1">); bez </call> i bez </copy> je odpověď useknutá.
+      const bodyStart = m.index + full.length;
+      const end = findBodyEnd(src, bodyStart, `</${name}>`);
+      const blockEnd = src.indexOf(CLOSE_TAG, bodyStart);
+      if (end >= 0 && (blockEnd < 0 || end < blockEnd)) {
+        action.body = trimBody(src.slice(bodyStart, end));
+        tagRe.lastIndex = end + name.length + 3;
+      } else if (blockEnd < 0) {
+        out.truncatedAction = { tool: name, attrs, index: action.index };
+        out.errors.push(`Missing closing </${name}> for <${name} tool="${attrs.tool ?? ""}">: the reply was cut off there, so this action was SKIPPED (actions before it ran). Resend it complete.`);
+        break;
+      }
+    } else if (BODY_TOOLS.has(name)) {
       if (selfClose) {
         out.errors.push(`<${name}> requires a body and a closing </${name}> tag.`);
         continue;
@@ -133,6 +147,16 @@ function scanBlock(src: string, start: number): Scan {
       }
       action.body = trimBody(src.slice(bodyStart, end));
       tagRe.lastIndex = end + endMarker.length;
+    } else if (!selfClose) {
+      // Akce bez těla napsaná jako párový tag (<skill name="x">--review</skill>): krátký text mezi tagy
+      // bere jako args, uzavírací tag se přeskočí.
+      const after = m.index + full.length;
+      const end = src.indexOf(`</${name}>`, after);
+      const inner = end < 0 ? "" : src.slice(after, end);
+      if (end >= 0 && inner.length <= 400 && !inner.includes("<")) {
+        if (name === "skill" && !attrs.args && inner.trim()) attrs.args = inner.trim();
+        tagRe.lastIndex = end + name.length + 3;
+      }
     }
     if (validate(action, out)) out.actions.push(action);
   }

@@ -1,12 +1,11 @@
 import { Host } from "../host/Host";
 import { STATE_DIR } from "../protocol/roots";
 import { ActionResult } from "../protocol/schema";
-import { globToRegExp } from "../protocol/text";
+import { BINARY_EXT, globToRegExp } from "../protocol/text";
 
 /** První řádek svazku; podle něj se pozná, že text ve schránce je náš (ne odpověď modelu). */
 export const BUNDLE_MARKER = "# Copy Agent bundle";
 
-const BINARY_EXT = /\.(png|jpe?g|gif|bmp|ico|webp|svgz|pdf|zip|gz|tgz|7z|rar|jar|exe|dll|so|dylib|bin|dat|db|sqlite|woff2?|ttf|otf|eot|mp[34]|wav|ogg|mov|avi|lock|vsix)$/i;
 
 export interface BundleOptions {
   /** limit velikosti svazku ve znacích; 0/undefined = bez limitu */
@@ -40,7 +39,7 @@ export async function toolBundle(host: Host, attrs: Record<string, string>, turn
     .filter(Boolean);
   if (!all && patterns.length === 0) return { tool: "bundle", attrs, status: "error", output: 'Give paths="a.ts, src/**/*.py" (comma-separated paths or globs) or all="true".' };
 
-  const allFiles = await host.listFiles("**/*", 20_000);
+  const allFiles = await host.listFiles("**/*", host.index ? 500_000 : 20_000);
   const candidates: string[] = [];
   const seen = new Set<string>();
   const add = (p: string) => {
@@ -66,18 +65,41 @@ export async function toolBundle(host: Host, attrs: Record<string, string>, turn
   const picked: { path: string; text: string; lines: number }[] = [];
   const skipped: string[] = [];
   let total = 0;
-  for (const p of candidates.sort()) {
+  const sorted = candidates.sort();
+  // texty se čtou souběžně po dávkách (s indexem z jeho mezipaměti); pořadí ve svazku zůstává podle cest
+  const idx = host.index;
+  const READ_BATCH = 24;
+  const loaded = new Map<string, string | null>();
+  const load = async (p: string): Promise<string | null> => {
+    if (BINARY_EXT.test(p)) return null;
+    try {
+      // velký soubor index nedrží: přečte se přímo (svazek ho smí obsahovat)
+      const viaIndex = idx && idx.has(p) && idx.entry(p)?.skipped !== "large" ? await idx.text(p) : undefined;
+      if (viaIndex !== undefined) return viaIndex;
+      if (idx?.entry(p)?.skipped === "binary") return "\u0000";
+      return await host.readFile(p);
+    } catch {
+      return null;
+    }
+  };
+  for (let i = 0; i < sorted.length; i++) {
+    const p = sorted[i];
+    if (!loaded.has(p)) {
+      const batch = sorted.slice(i, i + READ_BATCH);
+      const texts = await Promise.all(batch.map(load));
+      batch.forEach((b, k) => loaded.set(b, texts[k]));
+    }
     if (BINARY_EXT.test(p)) {
       skipped.push(`${p} (binary)`);
       continue;
     }
-    let text: string;
-    try {
-      text = await host.readFile(p);
-    } catch {
+    const got = loaded.get(p);
+    loaded.delete(p);
+    if (got === null || got === undefined) {
       skipped.push(`${p} (unreadable)`);
       continue;
     }
+    const text = got;
     if (text.includes("\u0000")) {
       skipped.push(`${p} (binary)`);
       continue;

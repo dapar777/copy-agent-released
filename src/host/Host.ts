@@ -1,3 +1,4 @@
+import type { WorkspaceIndex } from "../index/WorkspaceIndex";
 import { FileEncoding } from "../tools/encoding";
 
 /**
@@ -22,6 +23,8 @@ export interface HostPolicy {
   allowPatterns?: string[];
   deny: string[];
   protectedPaths: string[];
+  /** PowerShell spouštěný z <run> dostane -NoProfile -NonInteractive (rychlejší start); výchozí ano */
+  powershellNoProfile?: boolean;
 }
 
 export interface Host {
@@ -29,6 +32,8 @@ export interface Host {
   /** složky workspace; víc než jedna = multi-root */
   readonly folders: { name: string; path: string }[];
   readonly policy: HostPolicy;
+  /** index workspace: rychlé výpisy souborů, hledání přes slova, symboly; bez něj nástroje čtou disk přímo */
+  readonly index?: WorkspaceIndex;
 
   assertInside(rel: string): void;
   /** Kanonický tvar cesty (relativní k workspace, nebo `~/.copy-agent/…`); vyhodí chybu pro cestu mimo. */
@@ -47,6 +52,11 @@ export interface Host {
   run(command: string, cwdRel: string, timeoutMs: number, probeMs?: number, signal?: AbortSignal): Promise<RunResult>;
   /** Textový výpis chyb/varování; prázdný řetězec, když nic není nebo není k dispozici. */
   diagnostics(onlyRel?: string): Promise<string>;
+  /**
+   * Diagnostika po změně souborů: počká, až ji jazykové servery přepočítají (jen tak dlouho, jak je
+   * potřeba). Host, který to neumí, ji nemá a volající počká pevnou dobu.
+   */
+  diagnosticsSettled?(onlyRel?: string): Promise<string>;
   screenshot(rel: string, opts: { window?: string }): Promise<{ width: number; height: number; window?: string }>;
   absolutePath(rel: string): string;
   confirmCommand(command: string, cwdRel: string): Promise<boolean>;

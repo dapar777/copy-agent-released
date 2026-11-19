@@ -4,11 +4,11 @@ import * as vscode from "vscode";
 import { ClipboardBridge, decoratePrompt } from "../clipboard/ClipboardBridge";
 import { VsCodeHost } from "../host/VsCodeHost";
 import { classifyProse, isOwnPrompt, looksLikeReply } from "../protocol/detect";
-import { buildAgentInstructions, buildCorrectionPrompt, BundleUsage, ProjectContext, ReviewMode, splitPrompt, Target } from "../protocol/prompt";
+import { buildAgentInstructions, buildCorrectionPrompt, BundleUsage, ProjectContext, ReviewMode, ScriptLanguage, splitPrompt, Target } from "../protocol/prompt";
 import { parseRefs } from "../protocol/refs";
-import { STATE_DIR } from "../protocol/roots";
+import { homeStateRelOf, isReviewData, STATE_DIR } from "../protocol/roots";
 import { BUILTIN_COMMANDS, composeTask, isHelpRequest, parseInput, skillHelp, SlashCommand } from "../protocol/slash";
-import { decodeEntities } from "../protocol/text";
+import { decodeEntities, OK_RUN_OUTPUT_MAX } from "../protocol/text";
 import { ReviewManager } from "../review/ReviewManager";
 import { ApprovalService } from "../safety/Approvals";
 import { Checkpoint } from "../safety/Checkpoint";
@@ -16,12 +16,18 @@ import { ensureVcsIgnore } from "../safety/VcsIgnore";
 import { addGlobalHook, appendAgentFeedback, appendGlobalInstructions, appendGlobalRule, readGlobalHooks, readGlobalInstructions, readGlobalRules, replaceGlobalHook, replaceGlobalRule } from "../skills/GlobalConfig";
 import { addHook, loadHooks, loadProjectHooks, saveProjectHooks } from "../skills/Hooks";
 import { loadSkills, saveScript, saveSkill } from "../skills/Skills";
+import { BUILTIN_TOOLS } from "../index/builtin";
+import type { IndexService } from "../index/IndexService";
+import type { Host } from "../host/Host";
+import { toolGrep } from "../tools/grep";
 import { renderRefs, resolveRefs } from "../tools/refs";
+import { runtimeInfo } from "../tools/runtime";
+import { CallRecord, CallTools, callInput, invokeTool, loadScriptTools, parseManifest, parseToolSuggestion, saveToolFiles, ScriptTool, signature, ToolApproval, ToolGate, toolsBase } from "../tools/scripttools";
 import { ChangeListener, PLAN_FILE } from "../tools/runner";
 import { cfg, CONFIG, kb, openDocumentWithEncoding, resolveInWorkspace, tryToRel, workspaceFolders, workspaceRoot } from "../util";
 import { Session } from "./Session";
 import { Suggestion } from "./SessionData";
-import { describeActions, describeResults, Transcript, TranscriptEvent } from "./Transcript";
+import { describeActions, describeResults, describeTimings, Transcript, TranscriptEvent } from "./Transcript";
 import { INSTRUCTION_FILES, RULES_FILE, TurnEngine } from "./TurnEngine";
 
 const HELP = [
@@ -29,11 +35,12 @@ const HELP = [
   "zkopírujte odpověď modelu (tlačítko kopírovat u bloku kódu) a Copy Agent ji sám převezme.",
   "",
   "Příkazy: /plan zadání (režim PLAN s checklistem), /suggest (návrhy skillů, hooků a úkolů z průběhu), /auto (schvalování",
-  "příkazů), /resend (nový chat), /undo (vrátit kolo), /stop, /new (vyčistit), /status, /skills, /instructions (instrukce",
+  "příkazů), /resend (nový chat), /undo (vrátit kolo), /stop, /new (vyčistit), /status, /skills, /tools, /instructions (instrukce",
   "pro agenta v Copilotu do schránky), /název-skillu zadání.",
   "",
   "Vestavěné skilly: /init (AGENTS.md z průzkumu projektu), /commit, /review, /test, /fix <chyba>, /explain <co>, /docs, /deps.",
   "Vlastní skilly: .copy-agent/skills/ (projekt) nebo ~/.copy-agent/skills/ (uživatel).",
+  "Nástroje (model je volá akcí <call> a dostane jen odpověď): .copy-agent/tools/ nebo ~/.copy-agent/tools/; nový: /tool-creator.",
   "",
   "Během čekání na odpověď můžete psát poznámky; přiloží se k dalšímu promptu. Když se model zeptá, odpověď napište sem.",
   "Nastavení: tlačítko ⚙ v horní liště, nebo Ctrl+, a hledat „copyAgent“. Instrukce pro projekt: AGENTS.md v kořeni.",
@@ -56,6 +63,14 @@ export class Controller implements vscode.Disposable {
   /** "fresh" = prompt ve schránce, ještě nevložen; "sent" = vložen, čeká se na model */
   promptPhase: "fresh" | "sent" | undefined;
   builtinSkillsDir?: string;
+  /** úložiště rozšíření: pamatuje si, kterému obsahu nástrojů uživatel věří */
+  globalState?: vscode.Memento;
+  /** index workspace (rychlé hledání a výpisy, vestavěné nástroje); žije po celou dobu běhu rozšíření */
+  indexService?: IndexService;
+  /** poslední volání nástrojů (pro panel) */
+  toolCalls: CallRecord[] = [];
+  private gate: ToolGate | undefined;
+  private toolsCache: { at: number; list: ScriptTool[]; info: unknown[] } | undefined;
   /** přiložit celou codebase k dalšímu úkolu (zaškrtávátko v panelu; výchozí z copyAgent.context.fullBundle) */
   fullBundle = true;
   private readonly configSub: vscode.Disposable;
@@ -123,6 +138,215 @@ export class Controller implements vscode.Disposable {
     return this.skills.map((k) => ({ name: k.name, description: k.description, scope: this.skillScope(k) }));
   }
 
+  // ---------- nástroje (<call>) ----------
+
+  /** Nástroje z projektu a z ~/.copy-agent/tools; vypnout jde nastavením copyAgent.tools.enabled. */
+  loadTools(): ScriptTool[] {
+    if (!cfg<boolean>("tools.enabled", true)) return [];
+    let own: ScriptTool[] = [];
+    try {
+      own = loadScriptTools(workspaceRoot().fsPath);
+    } catch {
+      own = [];
+    }
+    // vestavěné nástroje nad indexem; vlastní nástroj stejného jména má přednost
+    const builtin = cfg<boolean>("tools.builtin", true) && this.indexService?.index ? BUILTIN_TOOLS.filter((b) => !own.some((t) => t.name === b.name)) : [];
+    return [...own, ...builtin];
+  }
+
+  /**
+   * Seznam a stav nástrojů pro panel. Panel se překresluje často a stav potřebuje otisk obsahu
+   * každého nástroje, proto se počítá nejvýš jednou za pár sekund (po změně nástroje nebo schválení hned).
+   */
+  private cachedTools(): { list: ScriptTool[]; info: unknown[] } {
+    if (!this.toolsCache || Date.now() - this.toolsCache.at > 4000) {
+      const list = this.loadTools();
+      this.toolsCache = { at: Date.now(), list, info: this.describeToolsForPanel(list) };
+    }
+    return this.toolsCache;
+  }
+
+  reloadTools(): void {
+    this.toolsCache = undefined;
+    this.changeEmitter.fire();
+  }
+
+  private trustStore(): { get(file: string): string | undefined; set(file: string, hash: string): PromiseLike<void> | void } {
+    const key = "copyAgent.trustedTools";
+    const memory = new Map<string, string>();
+    const state = this.globalState;
+    if (!state) return { get: (f) => memory.get(f), set: (f, h) => void memory.set(f, h) };
+    return {
+      get: (f) => state.get<Record<string, string>>(key, {})[f],
+      set: (f, h) => state.update(key, { ...state.get<Record<string, string>>(key, {}), [f]: h }),
+    };
+  }
+
+  private toolGate(): ToolGate {
+    return (this.gate ??= new ToolGate(this.trustStore(), (req) => this.askTool(req)));
+  }
+
+  /** Cesta k tool.json, jak ji zná panel i model (relativní, nebo `~/.copy-agent/…`). */
+  toolRel(tool: ScriptTool): string {
+    if (tool.scope === "builtin") return "";
+    return tool.scope === "global" ? (homeStateRelOf(tool.file) ?? tool.file) : (tryToRel(vscode.Uri.file(tool.file)) ?? tool.file);
+  }
+
+  /** Karta ke schválení volání nástroje: proč se ptá, co se spustí a s jakými argumenty. */
+  private askTool(req: ToolApproval): Promise<boolean> {
+    const t = req.tool;
+    const why = [
+      req.trust === "new" ? "Nový nástroj: poprvé se spustí jeho kód. Povolení platí, dokud se obsah jeho složky nezmění." : req.trust === "changed" ? "Obsah nástroje se od posledního povolení změnil; povolení platí pro nové znění." : "",
+      req.writes ? "Nástroj může měnit data (v tool.json nemá \"readOnly\": true), proto se schvaluje každé volání." : "",
+    ].filter(Boolean);
+    const text = [`${t.name} · ${t.scope === "global" ? "globální" : "projektový"} nástroj`, ...why, `Spustí: ${t.run}`, `Argumenty: ${JSON.stringify(req.args)}`].join("\n");
+    // po rozhodnutí se v panelu změní stav nástroje (povolen)
+    return this.approvals.request("tool", text, undefined, this.toolRel(t)).finally(() => this.reloadTools());
+  }
+
+  private callTools(): CallTools {
+    return {
+      list: () => this.loadTools(),
+      gate: this.toolGate(),
+      python: async () => (await runtimeInfo()).python?.command,
+      onCall: (rec) => {
+        this.toolCalls = [...this.toolCalls, rec].slice(-30);
+        this.changeEmitter.fire();
+      },
+    };
+  }
+
+  /** Nástroje pro panel: stav (platný, nový, změněný, důvěryhodný), podpis a argumenty pro formulář. */
+  toolsInfo(): unknown[] {
+    return this.cachedTools().info;
+  }
+
+  private describeToolsForPanel(list: ScriptTool[]): unknown[] {
+    const gate = this.toolGate();
+    return list.map((t) => ({
+      name: t.name,
+      scope: t.scope,
+      description: t.description,
+      output: t.output,
+      readOnly: t.readOnly,
+      signature: t.errors.length ? t.name : signature(t),
+      errors: t.errors,
+      trust: t.errors.length ? "invalid" : t.builtin ? "builtin" : gate.status(t),
+      path: this.toolRel(t),
+      examples: t.examples.length,
+      props: Object.entries(t.inputSchema.properties).map(([name, p]) => ({ name, type: p.type ?? "enum", enum: p.enum, required: t.inputSchema.required.includes(name), description: p.description ?? "", default: p.default })),
+    }));
+  }
+
+  /**
+   * Vyzkoušení nástroje z panelu: s argumenty z formuláře, bez nich na příkladech z tool.json.
+   * Odpověď se ukáže v proudu panelu; schvaluje se stejně jako volání od modelu.
+   */
+  async tryTool(name: string, argsJson?: string, fromForm = false): Promise<void> {
+    const tool = this.loadTools().find((t) => t.name === name);
+    if (!tool) throw new Error(`nástroj ${name} neexistuje`);
+    if (tool.errors.length) {
+      this.pushItem({ kind: "error", text: `Nástroj ${name} nejde spustit, tool.json má chyby:\n${tool.errors.map((e) => "- " + e).join("\n")}` });
+      return;
+    }
+    // z formuláře přijdou texty (jako atributy <call>): převedou se podle schématu
+    const runs: { input: Record<string, unknown>; fromAttrs: Set<string> }[] = [];
+    if (argsJson?.trim()) {
+      const parsed = callInput({}, argsJson);
+      if (parsed.errors.length) throw new Error("argumenty musí být JSON objekt");
+      runs.push({ input: parsed.input, fromAttrs: new Set(fromForm ? Object.keys(parsed.input).filter((k) => typeof parsed.input[k] === "string") : []) });
+    } else runs.push(...tool.examples.map((e) => ({ input: e.args, fromAttrs: new Set<string>() })));
+    if (!runs.length) {
+      this.pushItem({ kind: "system", text: `Nástroj ${name} nemá v tool.json žádné příklady; vyplňte argumenty ve formuláři.` });
+      return;
+    }
+    const tools = this.callTools();
+    for (const { input, fromAttrs } of runs) {
+      const r = await invokeTool(tools, tool, input, fromAttrs, { workspace: workspaceRoot().fsPath, roots: workspaceFolders().map((f) => f.fsPath), source: "user", host: this.host ?? this.newEngine().host });
+      const head = `Nástroj **${name}** ${JSON.stringify(r.args)}`;
+      if (r.rejected) this.pushItem({ kind: "error", text: `${name}: argumenty neprošly kontrolou, nástroj se nespustil:\n${r.rejected.map((e) => "- " + e).join("\n")}\nPodpis: ${signature(tool)}` });
+      else if (r.status === "denied") this.pushItem({ kind: "system", text: `${head}: spuštění zamítnuto.` });
+      else {
+        const body = r.response?.json !== undefined ? JSON.stringify(r.response.json, null, 2) : r.text;
+        const clipped = body.length > 4000 ? body.slice(0, 4000) + `\n… (${body.length - 4000} dalších znaků)` : body;
+        this.pushItem({ kind: r.status === "ok" ? "system" : "error", text: `${head}: ${r.status === "ok" ? "✓" : "✗"} ${r.response?.durationMs ?? 0} ms\n\n\`\`\`\n${clipped || "(nic nevypsal)"}\n\`\`\`` });
+      }
+    }
+  }
+
+  /**
+   * Změří na tomto workspace, jak dlouho trvá výpis souborů a hledání s indexem a bez něj (jako před
+   * zavedením indexu). Výsledek vypíše do panelu; nic nemění.
+   */
+  async benchmark(): Promise<void> {
+    const host = this.host ?? this.newEngine().host;
+    const index = this.indexService?.index;
+    const rows: string[] = [];
+    const time = async (label: string, fn: () => Promise<string>): Promise<void> => {
+      const started = Date.now();
+      let info: string;
+      try {
+        info = await fn();
+      } catch (e) {
+        info = `chyba: ${(e as Error).message}`;
+      }
+      rows.push(`- ${label}: ${Date.now() - started} ms${info ? ` (${info})` : ""}`);
+    };
+    this.pushItem({ kind: "system", text: "Měřím rychlost výpisu souborů a hledání na tomto workspace; u velkého workspace to bez indexu chvíli trvá…" });
+    if (index) {
+      await time("index: ověření disku (průchod všech souborů)", async () => {
+        index.markStale();
+        await index.ensureFresh();
+        return `${index.stats().files} souborů`;
+      });
+      await time("index: dočtení obsahu souborů", async () => {
+        const done = await index.whenDeep(15 * 60_000);
+        const s = index.stats();
+        return `${s.indexed} z ${s.files}${done ? "" : ", nedokončeno"}; otisky ${(s.bloomBytes / 1024 / 1024).toFixed(1)} MB, mezipaměť ${(s.cacheBytes / 1024 / 1024).toFixed(0)} MB`;
+      });
+    } else rows.push("- index je vypnutý (copyAgent.index.enabled)");
+    // hledaný text: delší identifikátor ze souboru uprostřed seznamu
+    const all = await host.listFiles("**/*", 500_000);
+    let word = "";
+    for (let i = Math.floor(all.length / 2); i < all.length && !word; i++) {
+      if (!/\.(sql|pk[sb]|pls|plb|ts|js|py|java|cs|xml|txt|md)$/i.test(all[i])) continue;
+      try {
+        word = [...(await host.readFile(all[i])).matchAll(/[A-Za-z_][A-Za-z0-9_]{9,30}/g)].map((m) => m[0]).sort((a, b) => b.length - a.length)[0] ?? "";
+      } catch {
+        word = "";
+      }
+    }
+    word ||= "copy_agent_benchmark";
+    const grep = (h: Host, pattern: string) => async () => {
+      const r = await toolGrep(h, { pattern });
+      return `${r.meta?.matches ?? 0} shod, prohledáno ${r.meta?.files ?? 0} souborů`;
+    };
+    await time("výpis všech souborů", async () => `${(await host.listFiles("**/*", 500_000)).length} souborů`);
+    await time(`hledání „${word}“`, grep(host, word));
+    await time(`hledání „${word}“ podruhé`, grep(host, word));
+    await time("hledání regulárním výrazem bez pevného textu", grep(host, "[A-Z]{4}_[0-9]{5}\\b"));
+    if (index) {
+      // totéž jako před zavedením indexu: findFiles a čtení souborů z disku (nejvýš prvních 5 000)
+      const plain = Object.create(host, { index: { value: undefined } }) as Host;
+      await time("bez indexu: výpis všech souborů", async () => `${(await plain.listFiles("**/*", 500_000)).length} souborů`);
+      await time(`bez indexu: hledání „${word}“`, grep(plain, word));
+    }
+    this.pushItem({ kind: "system", text: ["Rychlost na tomto workspace:", ...rows].join("\n") });
+  }
+
+  private describeTools(): string {
+    const tools = this.loadTools();
+    if (!tools.length) return "Žádné nástroje. Nový vytvoříte přes /tool-creator <název> <co má vracet> [--local]; složky .copy-agent/tools/ (projekt) a ~/.copy-agent/tools/ (globální).";
+    const gate = this.toolGate();
+    const state = (t: ScriptTool) => (t.errors.length ? `CHYBA: ${t.errors[0]}` : t.builtin ? "běží v rozšíření" : { new: "zatím nespuštěn", changed: "změněn od povolení", ok: "povolen" }[gate.status(t)]);
+    return [
+      "Nástroje (model je volá akcí <call>; vyzkoušet jdou v panelu, ikona klíče):",
+      ...tools.map((t) => `- ${t.errors.length ? t.name : signature(t)} – ${t.description || "(bez popisu)"} [${t.scope === "global" ? "globální" : t.scope === "builtin" ? "vestavěný" : "projekt"}, ${t.readOnly ? "jen čte" : "mění data"}, ${state(t)}]`),
+      "",
+      "Nový nástroj: /tool-creator <název> <co má vracet> [--local]",
+    ].join("\n");
+  }
+
   /** Instrukce pro agenta v Copilotu (Teams) do schránky. */
   async copyAgentInstructions(): Promise<void> {
     const text = buildAgentInstructions({ language: cfg("prompt.language", "cs"), replyMaxChars: cfg("reply.maxChars", 9000), bundleUsage: cfg<BundleUsage>("bundle.usage", "encourage"), reviewBeforeDone: cfg<ReviewMode>("review.beforeDone", "auto") });
@@ -170,6 +394,16 @@ export class Controller implements vscode.Disposable {
           return;
         case "status":
           this.pushItem({ kind: "system", text: this.describeStatus() });
+          return;
+        case "index":
+          this.pushItem({ kind: "system", text: this.indexService?.describe() ?? "Index workspace není k dispozici." });
+          return;
+        case "bench":
+          await this.benchmark();
+          return;
+        case "tools":
+          this.reloadTools();
+          this.pushItem({ kind: "system", text: this.describeTools() });
           return;
         case "skills":
           this.pushItem({
@@ -244,10 +478,13 @@ export class Controller implements vscode.Disposable {
     const previous = this.session.current?.id;
     const s = this.session.start(task);
     s.planMode = planMode;
+    this.review.setTitle(original ?? task);
     this.items = [];
     this.pushItem({ kind: "task", text: original ?? task, data: { planMode } });
     this.logLine(`▶ Nový úkol${planMode ? " (PLAN)" : ""}: ${task.split("\n")[0]}`);
     const engine = this.newEngine();
+    // nový úkol: index si na pozadí ověří disk (pojistka pro změny, které sledování souborů nezachytilo)
+    this.indexService?.index?.refreshInBackground();
     await this.ensureVcsIgnore();
     await engine.archivePlan(previous);
     await this.transcript?.append({ session: s.id, kind: "task", text: task, data: { planMode } });
@@ -320,6 +557,11 @@ export class Controller implements vscode.Disposable {
       switch (sug.kind) {
         case "skill":
           return this.skills.some((k) => k.name === norm(sug.title).replace(/[^a-z0-9._-]+/g, "-") || (k.body && norm(k.body) === body));
+        case "tool": {
+          const parsed = parseToolSuggestion(sug.body);
+          const name = "manifest" in parsed ? parseManifest(parsed.manifest, "x", { dir: "", file: "", scope: "project" }).name : "";
+          return this.loadTools().some((t) => t.name === name || t.name === norm(sug.title));
+        }
         case "rule": {
           const rules = [...readGlobalRules()];
           if (await host.exists(RULES_FILE)) rules.push(...(await host.readFile(RULES_FILE)).split(/\r?\n/).map((l) => l.replace(/^\s*[-*]\s+/, "").trim()).filter(Boolean));
@@ -351,7 +593,7 @@ export class Controller implements vscode.Disposable {
   private async applySuggestion(sug: Suggestion): Promise<void> {
     const host = this.host ?? this.newEngine().host;
     const global = sug.scope === "global";
-    if (["rule", "instructions", "skill", "script", "agent", "task"].includes(sug.kind)) sug.body = decodeEntities(sug.body);
+    if (["rule", "instructions", "skill", "tool", "script", "agent", "task"].includes(sug.kind)) sug.body = decodeEntities(sug.body);
     switch (sug.kind) {
       case "skill": {
         if (sug.update) {
@@ -360,6 +602,24 @@ export class Controller implements vscode.Disposable {
           fs.writeFileSync(existing.source, sug.body.trim() + "\n", "utf8");
         } else saveSkill(workspaceRoot().fsPath, sug.title, sug.body, global);
         this.reloadSkills();
+        return;
+      }
+      case "tool": {
+        const parsed = parseToolSuggestion(sug.body);
+        if ("error" in parsed) throw new Error(parsed.error);
+        let name = sug.update?.trim().toLowerCase() || "";
+        try {
+          const raw = JSON.parse(parsed.manifest) as { name?: unknown };
+          if (!name && typeof raw.name === "string") name = raw.name.trim();
+        } catch {
+          throw new Error("tool.json v návrhu není platný JSON");
+        }
+        name ||= sug.title.trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+        const check = parseManifest(parsed.manifest, name, { dir: "", file: "", scope: global ? "global" : "project" });
+        if (check.errors.length) throw new Error(`tool.json v návrhu má chyby: ${check.errors.join("; ")}`);
+        const dir = saveToolFiles(toolsBase(workspaceRoot().fsPath, global), name, parsed.files);
+        this.reloadTools();
+        this.pushItem({ kind: "system", text: `Nástroj ${name} uložen do ${global ? homeStateRelOf(dir) ?? dir : tryToRel(vscode.Uri.file(dir)) ?? dir}. Vyzkoušíte ho v panelu (ikona klíče); model ho od dalšího úkolu uvidí v seznamu Tools. Při prvním spuštění se Copy Agent zeptá.` });
         return;
       }
       case "script": {
@@ -674,9 +934,11 @@ export class Controller implements vscode.Disposable {
         if (parsed.actions.length && isFinalPart) {
           this.session.update({ state: "executing" });
           const all = [...(s.replyParts ?? []).flatMap((p) => p.actions), ...parsed.actions];
-          this.pushItem({ kind: "actions", turn: s.turn, text: describeActions(all), data: all.map((a) => ({ tool: a.tool, target: a.attrs.path ?? a.attrs.pattern ?? a.attrs.title ?? a.attrs.from ?? (a.tool === "run" ? (a.body ?? "").trim().slice(0, 120) : "") })) });
+          this.pushItem({ kind: "actions", turn: s.turn, text: describeActions(all), data: all.map((a) => ({ tool: a.tool, target: a.attrs.path ?? a.attrs.pattern ?? a.attrs.title ?? a.attrs.from ?? a.attrs.tool ?? (a.tool === "run" ? (a.body ?? "").trim().slice(0, 120) : "") })) });
           await this.transcript?.append({ session: s.id, kind: "actions", turn: s.turn, text: describeActions(all) });
-          await this.checkpoint.take(s.turn);
+          // checkpoint (git stash) jen u bloku, který může něco změnit; čtecí kolo ho nepotřebuje
+          const mutating = all.some((a) => ["write", "edit", "move", "delete", "run"].includes(a.tool) || (a.tool === "call" && !this.loadTools().find((t) => t.name === (a.attrs.tool ?? "").trim().toLowerCase())?.readOnly));
+          if (mutating) await this.checkpoint.take(s.turn);
         }
         this.execAbort = new AbortController();
         let idx = 0;
@@ -684,7 +946,7 @@ export class Controller implements vscode.Disposable {
           signal: this.execAbort.signal,
           onStart: (a) => {
             idx++;
-            const target = a.attrs.path ?? a.attrs.pattern ?? a.attrs.title ?? a.attrs.from ?? (a.tool === "run" ? (a.body ?? "").trim().split("\n")[0].slice(0, 100) : "");
+            const target = a.attrs.path ?? a.attrs.pattern ?? a.attrs.title ?? a.attrs.from ?? a.attrs.tool ?? (a.tool === "run" ? (a.body ?? "").trim().split("\n")[0].slice(0, 100) : "");
             this.currentAction = { tool: a.tool, target, startedAt: Date.now(), index: idx, total: parsed.actions.filter((x) => !["status", "ask", "done", "dialog"].includes(x.tool)).length };
             this.changeEmitter.fire();
           },
@@ -707,9 +969,16 @@ export class Controller implements vscode.Disposable {
             await this.transcript?.append({ session: s.id, kind: "dialog", turn: rec.turn, text: `${d.from}: ${d.text}` });
           }
           if (rec.status) this.pushItem({ kind: "status", turn: rec.turn, text: rec.status });
-          this.pushItem({ kind: "results", turn: rec.turn, text: describeResults(rec.results), data: rec.results.map((r) => ({ tool: r.tool, target: r.attrs.path ?? r.attrs.pattern ?? r.meta?.command ?? "", status: r.status, meta: r.meta })) });
+          this.pushItem({ kind: "results", turn: rec.turn, text: describeResults(rec.results), data: rec.results.map((r) => ({ tool: r.tool, target: r.attrs.path ?? r.attrs.pattern ?? r.meta?.command ?? r.attrs.tool ?? "", status: r.status, meta: r.meta })) });
           if (rec.results.some((r) => ["write", "edit", "move", "delete"].includes(r.tool) && /(^|\/)\.copy-agent\/skills\//.test(String(r.attrs.path ?? r.attrs.to ?? r.attrs.from ?? "")))) this.reloadSkills();
+          if (rec.results.some((r) => ["write", "edit", "move", "delete"].includes(r.tool) && /(^|\/)\.copy-agent\/tools\//.test(String(r.attrs.path ?? r.attrs.to ?? r.attrs.from ?? "")))) this.reloadTools();
           await this.transcript?.append({ session: s.id, kind: "results", turn: rec.turn, text: describeResults(rec.results) });
+          // kde se kolo zdrželo (jen když akce trvaly znatelně): viditelné v panelu i v logu
+          const timing = describeTimings(rec);
+          if (timing) {
+            this.pushItem({ kind: "info", turn: rec.turn, text: timing, data: { icon: "clock" } });
+            this.logLine(`⏱ kolo ${rec.turn}: ${timing}`);
+          }
           if (s.plan && rec.actions.some((a) => a.tool === "plan")) {
             this.pushItem({ kind: "plan", turn: rec.turn, text: s.plan });
             await this.transcript?.append({ session: s.id, kind: "plan", turn: rec.turn, text: s.plan });
@@ -770,15 +1039,17 @@ export class Controller implements vscode.Disposable {
 
   private newEngine(): TurnEngine {
     this.host?.dispose();
-    const host = new VsCodeHost(this.output, this.approvals);
+    const host = new VsCodeHost(this.output, this.approvals, () => this.indexService?.index);
     this.host = host;
     this.transcript = new Transcript(host);
     const listener: ChangeListener = {
       onWillChange: (path, kind, baseline, turn) => {
-        this.review.register(path, kind, baseline, turn);
+        // Data pro rozšíření Review změn nejsou úpravy kódu: do čekajících změn nepatří.
+        if (!isReviewData(path)) this.review.register(path, kind, baseline, turn);
         if (kind === "create") this.checkpoint.noteCreated(turn, path);
       },
       onWillDelete: (path, content, turn) => this.review.registerDelete(path, content, turn),
+      onNote: (note) => { if (!isReviewData(note.path)) this.review.addNote(note); },
       approve: cfg<boolean>("review.requireApproval", false) ? (p, b, a) => this.approveDiff(p, b, a) : undefined,
     };
     const engine = new TurnEngine(
@@ -788,10 +1059,13 @@ export class Controller implements vscode.Disposable {
         maxChars: cfg("prompt.maxChars", 80000),
         maxParts: 6,
         resultMaxChars: cfg("prompt.resultMaxChars", 6000),
+        runOutputMaxChars: cfg("prompt.runOutputMaxChars", OK_RUN_OUTPUT_MAX),
         replyMaxChars: cfg("reply.maxChars", 9000),
         language: cfg("prompt.language", "cs"),
         treeMaxEntries: cfg("prompt.treeMaxEntries", 120),
         planAuto: cfg("plan.auto", true),
+        describeChanges: cfg<boolean>("review.describeChanges", false),
+        skills: () => this.skills,
         continuousSuggest: cfg("suggest.continuous", false),
         directDialog: cfg("ask.direct", true),
         bundleUsage: cfg<BundleUsage>("bundle.usage", "encourage"),
@@ -800,6 +1074,8 @@ export class Controller implements vscode.Disposable {
         autoContextMaxChars: cfg("context.autoMaxChars", 14000),
         bundleInline: cfg<string>("bundle.delivery", "file") === "text",
         fullContext: cfg<boolean>("context.fullBundle", true),
+        scriptLanguage: cfg<ScriptLanguage>("scripts.language", "python"),
+        tools: this.callTools(),
       },
       listener,
     );
@@ -910,6 +1186,13 @@ export class Controller implements vscode.Disposable {
     this.cts?.cancel();
     this.cts?.dispose();
     this.cts = undefined;
+  }
+
+  /** Zprávy indexu workspace do logu rozšíření (panel se kvůli nim nepřekresluje). */
+  logIndex(line: string): void {
+    this.output.appendLine(`[${new Date().toLocaleTimeString("cs-CZ")}] ${line}`);
+    this.log.push(line);
+    if (this.log.length > 300) this.log.shift();
   }
 
   private logLine(line: string): void {

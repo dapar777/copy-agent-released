@@ -12,12 +12,15 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { TurnEngine } from "../engine/TurnEngine";
 import { createSession, SessionData } from "../engine/SessionData";
-import { describeActions, describeResults, Transcript } from "../engine/Transcript";
+import { describeActions, describeResults, describeTimings, Transcript } from "../engine/Transcript";
 import { NodeHost } from "../host/NodeHost";
+import { BUILTIN_TOOLS } from "../index/builtin";
 import { buildAgentInstructions, DEFAULT_OPTIONS, splitPrompt } from "../protocol/prompt";
 import { BUILTIN_COMMANDS, composeTask, parseInput } from "../protocol/slash";
 import { STATE_DIR } from "../protocol/roots";
 import { loadSkills } from "../skills/Skills";
+import { runtimeInfo } from "../tools/runtime";
+import { loadScriptTools, ToolGate } from "../tools/scripttools";
 
 const OUTBOX = `${STATE_DIR}/outbox.md`;
 const INBOX = `${STATE_DIR}/inbox.md`;
@@ -34,8 +37,15 @@ async function main(): Promise<void> {
     process.exit(2);
   }
   const rootAbs = path.resolve(root);
-  const host = new NodeHost(rootAbs, { autoConfirm: true, log: (l) => console.log("  " + l) });
+  // index se ukládá do .copy-agent: každé kolo je nový proces a jinak by se četlo všechno znovu
+  const host = new NodeHost(rootAbs, { autoConfirm: true, log: (l) => console.log("  " + l), indexFile: path.join(rootAbs, STATE_DIR, "index.bin") });
   const transcript = new Transcript(host);
+  // headless: nástrojům se věří a volání se povolí (zaloguje se), stejně jako příkazy s autoConfirm
+  const trust = new Map<string, string>();
+  const gate = new ToolGate({ get: (f) => trust.get(f), set: (f, h) => void trust.set(f, h) }, async (req) => {
+    console.log(`  ⚙ tool ${req.tool.name} (${req.trust}${req.writes ? ", changes data" : ""}) allowed: ${JSON.stringify(req.args)}`);
+    return true;
+  });
   const engine = new TurnEngine(host, {
     ...DEFAULT_OPTIONS,
     target: rest.includes("--generic") ? "generic" : "copilot-agent",
@@ -43,6 +53,16 @@ async function main(): Promise<void> {
     treeMaxEntries: 120,
     autoContext: !rest.includes("--no-auto"),
     bundleInline: false,
+    skills: () => loadSkills(rootAbs, path.join(__dirname, "..", "skills")),
+    tools: {
+      // vlastní nástroje a vestavěné nad indexem (vlastní stejného jména má přednost)
+      list: () => {
+        const own = loadScriptTools(rootAbs);
+        return [...own, ...BUILTIN_TOOLS.filter((b) => !own.some((t) => t.name === b.name))];
+      },
+      gate,
+      python: async () => (await runtimeInfo()).python?.command,
+    },
   });
 
   const load = async (): Promise<SessionData> => JSON.parse(await host.readFile(STATE)) as SessionData;
@@ -59,6 +79,14 @@ async function main(): Promise<void> {
     if (attachments.length) console.log(`📎 attachments: ${attachments.join(", ")}`);
   };
 
+  try {
+    await dispatch();
+  } finally {
+    // uloží index (i rozpracovaný): další kolo je nový proces a čte jen to, co se změnilo
+    await host.index.dispose();
+  }
+
+  async function dispatch(): Promise<void> {
   switch (cmd) {
     case "start": {
       const skills = loadSkills(rootAbs, path.join(__dirname, "..", "skills"));
@@ -103,6 +131,8 @@ async function main(): Promise<void> {
         const rec = step.record;
         await transcript.append({ session: s.id, kind: "actions", turn, text: describeActions(rec.actions) });
         await transcript.append({ session: s.id, kind: "results", turn, text: describeResults(rec.results) });
+        const timing = describeTimings(rec);
+        if (timing) console.log(`⏱ ${timing}`);
         if (step.kind === "done") await transcript.append({ session: s.id, kind: "done", text: step.summary });
         if (step.kind === "ask") await transcript.append({ session: s.id, kind: "ask", text: step.question });
       }
@@ -154,6 +184,7 @@ async function main(): Promise<void> {
     default:
       console.log(`unknown command ${cmd}`);
       process.exit(2);
+  }
   }
 }
 

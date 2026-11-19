@@ -9,7 +9,8 @@ export const READ_OUTLINE_ABOVE = 300;
 
 /** Předrenderovaný strom pro úvodní prompt: soubory kořene + adresáře s počty, kompaktně. */
 export async function renderTree(host: Host, maxEntries: number): Promise<string> {
-  const files = await host.listFiles("**/*", 5000);
+  // s indexem všechny soubory (počty ve stromu pak sedí i u velkého workspace), jinak prvních 5000
+  const files = await host.listFiles("**/*", host.index ? 500_000 : 5000);
   if (files.length <= maxEntries) return files.join("\n") || "(empty workspace)";
   const dirs = new Map<string, number>();
   for (const f of files) {
@@ -83,7 +84,7 @@ export async function toolLs(host: Host, attrs: Record<string, string>): Promise
   const rel = attrs.path && attrs.path !== "." ? attrs.path.replace(/\\/g, "/").replace(/\/+$/, "") : "";
   const depth = Math.min(4, Math.max(1, Number(attrs.depth) || 1));
   if (rel && !(await host.exists(rel))) return { tool: "ls", attrs, status: "error", output: `Directory not found: ${attrs.path}` };
-  const files = await host.listFiles(rel ? `${rel}/**/*` : "**/*", 5000);
+  const files = await host.listFiles(rel ? `${rel}/**/*` : "**/*", host.index ? 500_000 : 5000);
   const prefixLen = rel ? rel.length + 1 : 0;
   const entries = new Set<string>();
   for (const f of files) {

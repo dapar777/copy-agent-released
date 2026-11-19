@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { Controller } from "../engine/Controller";
-import { cfg, CONFIG } from "../util";
+import { cfg, CONFIG, tryToRel } from "../util";
 
 /**
  * Panel: jeden souvislý proud (zadání, prompt, akce, výsledky, otázky, schvalování, změny, návrhy),
@@ -16,6 +16,18 @@ export class SidebarView implements vscode.WebviewViewProvider {
   private filesCache: { at: number; list: string[]; version: number } = { at: 0, list: [], version: 0 };
   private filesRefreshing = false;
   private filesSentVersion = -1;
+  /** změny ke schválení se pro každé překreslení nečtou z disku znovu: stačí po změně v review, jinak po 2 s */
+  private reviewVersion = 0;
+  private hunksMemo: { at: number; version: number; hunks: Awaited<ReturnType<Controller["review"]["pendingHunks"]>> } | undefined;
+
+  private async pendingHunksCached(): Promise<Awaited<ReturnType<Controller["review"]["pendingHunks"]>>> {
+    const m = this.hunksMemo;
+    if (m && m.version === this.reviewVersion && Date.now() - m.at < 2000) return m.hunks;
+    const version = this.reviewVersion;
+    const hunks = await this.controller.review.pendingHunks();
+    this.hunksMemo = { at: Date.now(), version, hunks };
+    return hunks;
+  }
 
   constructor(
     private readonly controller: Controller,
@@ -23,7 +35,11 @@ export class SidebarView implements vscode.WebviewViewProvider {
   ) {
     controller.onDidChange(() => void this.push());
     controller.session.onDidChange(() => void this.push());
-    controller.review.onDidChange(() => void this.push());
+    controller.review.onDidChange(() => {
+      this.reviewVersion++;
+      void this.push();
+    });
+    controller.review.onDidChangeSummary(() => void this.push());
   }
 
   setBadge(value: number, tooltip: string): void {
@@ -103,6 +119,12 @@ export class SidebarView implements vscode.WebviewViewProvider {
         return c.resendContext();
       case "suggest":
         return c.runSuggest();
+      case "toolRun":
+        // může čekat na schválení déle než panel čeká na odpověď: běží na pozadí a výsledek přijde do proudu
+        void c.tryTool(m.text ?? "", m.always, !!m.approve).catch((e: Error) => void vscode.window.showErrorMessage(`Copy Agent: ${e.message}`));
+        return;
+      case "toolsReload":
+        return c.reloadTools();
       case "reloadSkills":
         return c.reloadSkills();
       case "transcript":
@@ -173,7 +195,7 @@ export class SidebarView implements vscode.WebviewViewProvider {
   private async doPush(): Promise<void> {
     if (!this.view) return;
     const c = this.controller;
-    const hunks = c.review.pendingFiles.length ? await c.review.pendingHunks() : [];
+    const hunks = c.review.pendingFiles.length ? await this.pendingHunksCached() : [];
     const files = await this.workspaceFilesCached();
     const s = c.session.current;
     const state = {
@@ -204,8 +226,19 @@ export class SidebarView implements vscode.WebviewViewProvider {
       target: cfg<string>("target", "copilot-agent"),
       delivery: cfg<string>("bundle.delivery", "text"),
       approvals: { mode: c.approvals.mode, pending: c.approvals.pendingRequests, history: c.approvals.history.slice(-8), patterns: c.approvals.allowPatterns() },
-      review: c.review.pendingFiles.map((f) => ({ path: f.path, kind: f.kind, hunks: hunks.filter((h) => h.path === f.path).length })),
+      review: {
+        // stav review z rozšíření Review změn (kroky plánu, schválené kusy); bez něj jen soubory a jejich změny
+        tool: c.review.usesReviewTool,
+        wanted: cfg<string>("review.tool", "review-zmen") === "review-zmen",
+        summary: c.review.summary ? { ...c.review.summary, soubory: c.review.summary.soubory.map((f) => ({ ...f, path: tryToRel(vscode.Uri.file(f.soubor)) })) } : undefined,
+        files: c.review.pendingFiles.map((f) => {
+          const mine = hunks.filter((h) => h.path === f.path);
+          return { path: f.path, kind: f.kind, hunks: mine.length, plus: mine.reduce((n, h) => n + h.hunk.newLines.length, 0), minus: mine.reduce((n, h) => n + h.hunk.oldLines.length, 0) };
+        }),
+      },
       commands: c.commands().map((x) => ({ name: x.name, kind: x.kind, description: x.description })),
+      tools: c.toolsInfo(),
+      toolCalls: c.toolCalls.slice(-12),
       files: files.version !== this.filesSentVersion ? files.list : undefined,
       editor: c.editorInfo(),
       log: c.log.slice(-80),
@@ -233,7 +266,7 @@ export class SidebarView implements vscode.WebviewViewProvider {
   button:hover { filter: brightness(1.1); } button.primary { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
   button.ghost { background: transparent; border-color: transparent; color: var(--muted); padding: 2px 6px; } button.ghost:hover { color: var(--fg); background: var(--card); }
   button.small { padding: 2px 8px; font-size: 11px; border-radius: 5px; } button.busy { opacity: .6; cursor: progress; }
-  input[type=text], textarea { font: inherit; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, var(--border)); border-radius: 6px; padding: 6px 8px; width: 100%; }
+  input[type=text], textarea, select { font: inherit; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, var(--border)); border-radius: 6px; padding: 6px 8px; width: 100%; }
   textarea:focus, input:focus { outline: 1px solid var(--vscode-focusBorder); }
   pre, code { font-family: var(--mono); font-size: 11.5px; }
   pre { margin: 6px 0 0; white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow: auto; background: var(--vscode-textCodeBlock-background, rgba(128,128,128,.12)); padding: 6px 8px; border-radius: 6px; }
@@ -259,7 +292,23 @@ export class SidebarView implements vscode.WebviewViewProvider {
   .card { padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--card); font-size: 12px; }
   .card .row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 2px 0; } .card .path { flex: 1; font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .card .path.clickable { cursor: pointer; } .card .path.clickable:hover { color: var(--vscode-textLink-foreground, var(--info)); text-decoration: underline; }
+  /* přehled změn: stejné prvky jako plán revize v rozšíření Review změn */
+  .rvh { display: flex; align-items: baseline; gap: 8px; } .rvh b { font-size: 13px; } .muted { color: var(--muted); font-size: 11px; }
+  .rvbar { height: 3px; border-radius: 2px; background: var(--border); margin: 6px 0 4px; overflow: hidden; } .rvbar i { display: block; height: 100%; background: var(--ok); }
+  .rvrow { display: flex; align-items: center; gap: 6px; min-height: 24px; padding: 1px 0; } .rvrow .nm, .rvrow .path { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rvrow .num { width: 18px; height: 18px; flex: none; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 10px; font-weight: 600; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); }
+  .rvrow.ok .num { background: color-mix(in srgb, var(--ok) 25%, transparent); color: var(--ok); } .rvrow.ok .nm, .rvrow.ok .path { color: var(--muted); }
+  .rvrow .st { width: 14px; flex: none; text-align: center; color: var(--muted); } .rvrow .cnt { color: var(--muted); font-size: 11px; flex: none; }
+  .rvrow .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--vscode-charts-red, var(--err)); }
+  .pm { font-family: var(--mono); font-size: 11px; flex: none; } .pm .p { color: var(--ok); font-weight: 600; } .pm .m { color: var(--err); font-weight: 600; margin-left: 4px; }
+  .rvsep { margin-top: 6px; font-size: 10px; text-transform: uppercase; letter-spacing: .4px; color: var(--muted); } .rvf { margin-top: 4px; }
   .sheet { margin: 0 10px 8px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--card); display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+  .tool { border-top: 1px solid var(--border); padding: 6px 0 2px; } .tool summary { cursor: pointer; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .tool .sig { display: block; font-family: var(--mono); font-size: 11px; margin: 4px 0; white-space: pre-wrap; word-break: break-word; }
+  .tool .targ { display: grid; grid-template-columns: minmax(70px, auto) 1fr; gap: 2px 8px; align-items: center; margin: 3px 0; } .tool .targ .sub { grid-column: 2; }
+  .tool .targ input, .tool .targ select { width: 100%; } .badge.ok { background: color-mix(in srgb, var(--ok) 30%, transparent); color: var(--fg); } .badge.warn { background: color-mix(in srgb, var(--warn) 35%, transparent); color: var(--fg); } .badge.err { background: color-mix(in srgb, var(--err) 35%, transparent); color: var(--fg); }
+  .note.err { color: var(--err); font-size: 11px; } pre.prev { margin: 0 0 4px 20px; max-height: 90px; overflow: auto; font-size: 11px; white-space: pre-wrap; word-break: break-word; }
+  .tooltext { white-space: pre-wrap; word-break: break-word; }
   .sheet .title { font-weight: 600; display: flex; align-items: center; gap: 6px; } .sheet .sub { color: var(--muted); font-size: 11px; } .sheet .btns { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
   .msg { border-radius: 10px; padding: 8px 10px; border: 1px solid var(--border); background: var(--card); font-size: 12.5px; line-height: 1.45; overflow-wrap: anywhere; }
   .msg .head { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); margin-bottom: 4px; } .msg .head b { color: var(--fg); }
@@ -304,13 +353,18 @@ export class SidebarView implements vscode.WebviewViewProvider {
     <button id="targetBtn" class="pill" title="Cílový chat: agent v Copilotu (krátké prompty) nebo obecný chat (celý protokol v prvním promptu)">copilot</button>
     <button id="modeBtn" class="pill" title="Schvalování příkazů mimo allowlist">ptát se</button>
     <span id="busy" class="pill busy" hidden></span>
-    <span class="menu"><button id="menuInstr" class="ghost small" title="Instrukce pro agenta v Copilotu (Teams) do schránky" data-ic="bot"></button><button id="menuSuggest" class="ghost small" title="Navrhnout skilly, hooky a úkoly z průběhu" data-ic="lightbulb"></button><button id="menuTranscript" class="ghost small" title="Otevřít záznam průběhu" data-ic="file-text"></button><button id="menuSettings" class="ghost small" title="Nastavení" data-ic="settings"></button></span>
+    <span class="menu"><button id="menuTools" class="ghost small" title="Nástroje, které model volá akcí &lt;call&gt;: seznam, vyzkoušení, poslední volání" data-ic="wrench"></button><button id="menuInstr" class="ghost small" title="Instrukce pro agenta v Copilotu (Teams) do schránky" data-ic="bot"></button><button id="menuSuggest" class="ghost small" title="Navrhnout skilly, hooky a úkoly z průběhu" data-ic="lightbulb"></button><button id="menuTranscript" class="ghost small" title="Otevřít záznam průběhu" data-ic="file-text"></button><button id="menuSettings" class="ghost small" title="Nastavení" data-ic="settings"></button></span>
   </div>
   <div id="exceptions" class="sheet" hidden>
     <div class="title">Schvalování příkazů<span class="spacer"></span><button id="exClose" class="ghost small" data-ic="x"></button></div>
     <div class="btns"><button id="modeAsk" class="small">ptát se</button><button id="modeAuto" class="small">auto (bez dotazů)</button><span class="sub">zakázané příkazy platí vždy</span></div>
     <details><summary class="sub">Výjimky: příkazy povolené regulárním výrazem <span id="exCount"></span></summary><div id="patterns"></div>
       <div class="btns"><input id="newPattern" type="text" placeholder="^npm (test|run lint)\\b"><button id="addPatternWs" class="small">Přidat (projekt)</button><button id="addPatternGlobal" class="small">Přidat (globálně)</button></div></details>
+  </div>
+  <div id="toolsSheet" class="sheet" hidden>
+    <div class="title">Nástroje<span class="sub">model je volá akcí &lt;call&gt; a dostane jen odpověď</span><span class="spacer"></span><button id="toolsReload" class="ghost small" title="Načíst znovu" data-ic="refresh"></button><button id="toolsClose" class="ghost small" data-ic="x"></button></div>
+    <div id="toolList"></div>
+    <div id="toolCalls"></div>
   </div>
   <div id="chat">
     <div id="stream"></div>
@@ -333,7 +387,7 @@ export class SidebarView implements vscode.WebviewViewProvider {
 <script nonce="${nonce}">
   const vscode = acquireVsCodeApi();
   const $ = (id) => document.getElementById(id);
-  const LABELS = { setFullBundle: "Ukládám volbu", send: "Odesílám", copyAgain: "Kopíruji prompt", nextPart: "Kopíruji další část", showPrompt: "Otevírám prompt", pasteClip: "Beru odpověď ze schránky", resend: "Skládám celý kontext", correction: "Posílám opravný prompt", suggest: "Připravuji návrhy", interrupt: "Přerušuji akce", stop: "Ruším úkol", undo: "Vracím poslední kolo", approve: "Zpracovávám rozhodnutí", suggestion: "Ukládám návrh", suggestionsAll: "Ukládám návrhy", setMode: "Měním schvalování", setTarget: "Měním cíl", autoAll: "Přepínám na auto", transcript: "Otevírám záznam", instructions: "Kopíruji instrukce", settings: "Otevírám nastavení", reviewNext: "Otevírám změny", acceptAll: "Přijímám změny", rejectAll: "Zamítám změny", acceptFile: "Přijímám soubor", rejectFile: "Zamítám soubor", openDiff: "Otevírám diff", addPattern: "Ukládám výjimku", removePattern: "Mažu výjimku" };
+  const LABELS = { setFullBundle: "Ukládám volbu", send: "Odesílám", copyAgain: "Kopíruji prompt", nextPart: "Kopíruji další část", showPrompt: "Otevírám prompt", pasteClip: "Beru odpověď ze schránky", resend: "Skládám celý kontext", correction: "Posílám opravný prompt", suggest: "Připravuji návrhy", interrupt: "Přerušuji akce", stop: "Ruším úkol", undo: "Vracím poslední kolo", approve: "Zpracovávám rozhodnutí", suggestion: "Ukládám návrh", suggestionsAll: "Ukládám návrhy", setMode: "Měním schvalování", setTarget: "Měním cíl", autoAll: "Přepínám na auto", transcript: "Otevírám záznam", instructions: "Kopíruji instrukce", settings: "Otevírám nastavení", reviewNext: "Otevírám změny", acceptAll: "Přijímám změny", rejectAll: "Zamítám změny", acceptFile: "Přijímám soubor", rejectFile: "Zamítám soubor", openDiff: "Otevírám diff", addPattern: "Ukládám výjimku", removePattern: "Mažu výjimku", toolRun: "Spouštím nástroj", toolsReload: "Načítám nástroje", openFile: "Otevírám soubor" };
   let reqSeq = 0; const pending = new Map(); let lastClicked = null; let lastClickAt = 0;
   document.addEventListener("click", (e) => { const b = e.target && e.target.closest ? e.target.closest("button") : null; if (b) { lastClicked = b; lastClickAt = Date.now(); } }, true);
   function showBusy(html, cls) { const el = $("busy"); el.innerHTML = html; el.className = "pill busy " + (cls || ""); el.hidden = false; }
@@ -375,11 +429,13 @@ export class SidebarView implements vscode.WebviewViewProvider {
     "check-circle": '<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><path d="m9 11 3 3L22 4"/>', "alert-circle": '<circle cx="12" cy="12" r="10"/><path d="M12 8v4"/><path d="M12 16h.01"/>',
     trash: '<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>', info: '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/>',
     message: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>', search: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>', plus: '<path d="M5 12h14"/><path d="M12 5v14"/>',
-    "square-check": '<rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/>', "square-empty": '<rect width="18" height="18" x="3" y="3" rx="2"/>',
+    "square-check": '<rect width="18" height="18" x="3" y="3" rx="2"/><path d="m9 12 2 2 4-4"/>',
+    clock: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
+    wrench: '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>', "square-empty": '<rect width="18" height="18" x="3" y="3" rx="2"/>',
   };
   const ic = (name, cls) => '<svg class="ic' + (cls ? " " + cls : "") + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + (ICONS[name] || "") + "</svg>";
   for (const el of document.querySelectorAll("[data-ic]")) el.innerHTML = ic(el.dataset.ic) + (el.dataset.label ? " " + el.dataset.label : "");
-  let state = { items: [], commands: [], approvals: { mode: "ask", pending: [], history: [] }, review: [], log: [] };
+  let state = { items: [], commands: [], approvals: { mode: "ask", pending: [], history: [] }, review: { files: [] }, log: [], tools: [], toolCalls: [] };
   let wasAsking = false;
   function md(text) {
     const lines = String(text ?? "").split("\\n"); let html = ""; let inList = false; let inPre = false; let pre = [];
@@ -437,7 +493,7 @@ export class SidebarView implements vscode.WebviewViewProvider {
     $("modeBtn").className = "pill" + (state.approvals.mode === "auto" ? " on" : "");
     $("targetBtn").textContent = state.target === "generic" ? "obecný chat" : "copilot agent";
     $("targetBtn").className = "pill" + (state.target === "generic" ? "" : " on");
-    renderExceptions(); renderSuggestions();
+    renderExceptions(); renderSuggestions(); renderTools();
     $("stopBtn").hidden = !(active && s.state !== "done"); $("undoBtn").hidden = !active; $("resendBtn").hidden = !(active && s.state !== "done");
     const banner = $("banner");
     if (active && STATE[s.state]) {
@@ -475,9 +531,9 @@ export class SidebarView implements vscode.WebviewViewProvider {
           // provádění stojí na schválení: karta to říká nahlas a schválit jde rovnou tady
           const a = pend[0];
           banner.className = "banner approval";
-          $("bannerTitle").textContent = (a.kind === "command" ? "Čeká na schválení příkazu" : "Čeká na schválení smazání") + " · kolo " + s.turn;
+          $("bannerTitle").textContent = (a.kind === "command" ? "Čeká na schválení příkazu" : a.kind === "tool" ? "Čeká na schválení nástroje" : "Čeká na schválení smazání") + " · kolo " + s.turn;
           $("bannerSub").innerHTML = (cur ? "Akce " + cur.index + "/" + cur.total + " stojí, dokud nerozhodnete" + (pend.length > 1 ? " (" + pend.length + " požadavky)" : "") + ":" : "Čeká se na vaše rozhodnutí:") + "<span class='cmd big'>" + esc(a.text) + "</span>" + (a.cwd && a.cwd !== "." ? "<span class='sub'>v " + esc(a.cwd) + "</span>" : "");
-          b.innerHTML = '<button class="primary small" data-act="allow" data-id="' + esc(a.id) + '">Povolit</button><button class="small" data-act="deny" data-id="' + esc(a.id) + '">Zamítnout</button>' + (a.kind === "command" ? '<button class="small" data-act="autoAll" title="Přepne schvalování na auto a povolí čekající příkazy">Auto (dál se neptat)</button>' : "") + '<button class="ghost small" data-act="interrupt">■ Přerušit akce</button>';
+          b.innerHTML = '<button class="primary small" data-act="allow" data-id="' + esc(a.id) + '">Povolit</button><button class="small" data-act="deny" data-id="' + esc(a.id) + '">Zamítnout</button>' + (a.kind === "tool" && a.path ? '<button class="small" data-act="openFile" data-path="' + esc(a.path) + '" title="Otevřít tool.json nástroje">tool.json</button>' : "") + (a.kind !== "delete" ? '<button class="small" data-act="autoAll" title="Přepne schvalování na auto a povolí čekající příkazy i nástroje">Auto (dál se neptat)</button>' : "") + '<button class="ghost small" data-act="interrupt">■ Přerušit akce</button>';
           for (const x of b.querySelectorAll("button")) x.onclick = onAct;
           return;
         }
@@ -496,10 +552,21 @@ export class SidebarView implements vscode.WebviewViewProvider {
     for (const a of chat.querySelectorAll("a.floc")) a.onclick = (e) => { e.preventDefault(); send("openFile", { path: a.dataset.path, text: a.dataset.line || "", always: a.dataset.col || "" }); };
     if (stick) requestAnimationFrame(() => { chat.scrollTop = chat.scrollHeight; });
 
-    const rv = $("review"); rv.hidden = state.review.length === 0;
-    if (state.review.length) {
-      rv.innerHTML = "<div class='row'><b>Změny ke schválení (" + state.review.length + ")</b><span class='spacer'></span><button class='small primary' data-act='reviewNext'>Projít</button><button class='small' data-act='acceptAll'>Přijmout vše</button><button class='small' data-act='rejectAll'>Zamítnout vše</button></div>" +
-        state.review.map((p) => "<div class='row'><span class='path" + (p.kind !== "delete" ? " clickable' data-act='openDiff' data-path='" + esc(p.path) + "' title='Otevřít diff: " + esc(p.path) : "' title='" + esc(p.path)) + "'>" + (p.kind === "create" ? "＋" : p.kind === "delete" ? "－" : "～") + " " + esc(p.path) + " <span class='badge'>" + p.hunks + "</span></span><button class='small' data-act='acceptFile' data-path='" + esc(p.path) + "'>✓</button><button class='small' data-act='rejectFile' data-path='" + esc(p.path) + "'>✗</button>" + (p.kind !== "delete" ? "<button class='small' data-act='openDiff' data-path='" + esc(p.path) + "'>diff</button>" : "") + "</div>").join("");
+    // Přehled změn ve stejné podobě jako plán revize v rozšíření Review změn: kroky plánu (když je model
+    // popsal), soubory se stavem, počtem řádků a kolik kusů je schváleno. Kliknutí otevře review na místě.
+    const R = state.review, rv = $("review"); rv.hidden = !R.files.length;
+    if (R.files.length) {
+      const sum = R.summary, sign = { create: "＋", pridan: "＋", delete: "－", smazan: "－" };
+      const pm = (a, b) => "<span class='pm'>" + (a ? "<b class='p'>+" + a + "</b>" : "") + (b ? "<b class='m'>−" + b + "</b>" : "") + "</span>";
+      const fileRow = (f) => "<div class='rvrow file" + (f.total && f.done === f.total ? " ok" : "") + "'><span class='st'>" + (sign[f.kind] || "～") + "</span><span class='path clickable' data-act='openDiff' data-path='" + esc(f.path) + "' title='" + esc(f.path) + (R.tool ? "\\nOtevřít v Review změn" : "\\nOtevřít diff") + "'>" + esc(f.path) + "</span>" + pm(f.plus, f.minus) +
+        (sum ? "<span class='cnt' title='schválené kusy'>" + f.done + "/" + f.total + "</span>" : "<span class='cnt' title='změn v souboru'>" + f.total + "</span>") +
+        "<button class='small' data-act='acceptFile' data-path='" + esc(f.path) + "' title='Přijmout změny v souboru'>✓</button><button class='small' data-act='rejectFile' data-path='" + esc(f.path) + "' title='Zamítnout změny v souboru'>✗</button></div>";
+      const files = sum ? sum.soubory.map((f) => ({ path: f.path || f.cesta, kind: f.stav, plus: f.plus, minus: f.minus, done: f.schvaleno, total: f.kusy })) : R.files.map((f) => ({ path: f.path, kind: f.kind, plus: f.plus, minus: f.minus, done: 0, total: f.hunks }));
+      const head = sum
+        ? "<div class='rvh'><b>Plán revize</b><span class='muted'>" + sum.schvaleno + " ze " + sum.kusy + " schváleno</span><span class='spacer'></span><button class='small primary' data-act='reviewNext' title='Otevřít změny v rozšíření Review změn'>Otevřít review</button></div><div class='rvbar'><i style='width:" + (sum.kusy ? Math.round(sum.schvaleno / sum.kusy * 100) : 0) + "%'></i></div>"
+        : "<div class='rvh'><b>Změny ke schválení</b><span class='muted'>" + R.files.length + (R.files.length === 1 ? " soubor" : R.files.length < 5 ? " soubory" : " souborů") + "</span><span class='spacer'></span><button class='small primary' data-act='reviewNext'>Projít</button></div>";
+      const steps = sum && sum.maAgenta ? sum.kroky.map((k) => "<div class='rvrow" + (k.kusy && k.schvaleno === k.kusy ? " ok" : "") + "'><span class='num'>" + (k.kusy && k.schvaleno === k.kusy ? "✓" : k.krok) + "</span><span class='nm' title='" + esc(k.nazev) + "'>" + esc(k.nazev) + "</span>" + (k.riziko === "vysoke" ? "<span class='dot' title='vysoké riziko'></span>" : "") + "<span class='cnt'>" + k.schvaleno + "/" + k.kusy + "</span></div>").join("") + "<div class='rvsep'>Soubory</div>" : "";
+      rv.innerHTML = head + steps + files.map(fileRow).join("") + "<div class='row rvf'>" + (R.tool || !R.wanted ? "" : "<span class='muted'>Rozšíření Review změn není nainstalované, změny se procházejí v editoru.</span>") + "<span class='spacer'></span><button class='small' data-act='acceptAll'>Přijmout vše</button><button class='small' data-act='rejectAll'>Zamítnout vše</button></div>";
       for (const x of rv.querySelectorAll("[data-act]")) x.onclick = onAct;
     }
     $("hint").textContent = !active ? "Enter odešle, / příkazy a skilly, # odkaz na soubor" : s.state === "awaitingUser" ? "Napište odpověď pro model a odešlete Enterem" : s.state === "waitingForReply" ? "Poznámky napsané teď se přiloží k dalšímu promptu; vložená odpověď modelu se rozpozná sama" : s.state === "done" ? "Další úkol, nebo /suggest" : "";
@@ -557,6 +624,10 @@ export class SidebarView implements vscode.WebviewViewProvider {
     }
   }
   function renderApproval(a) {
+    if (a.kind === "tool") {
+      return '<div class="msg approval" data-approval="' + esc(a.id) + '"><div class="head">' + ic("wrench") + "<b>Spustit nástroj?</b></div>" + '<div class="cmd tooltext">' + esc(a.text) + "</div>" +
+        '<div class="btns"><button class="primary small" data-act="allow" data-id="' + esc(a.id) + '">Povolit</button><button class="small" data-act="deny" data-id="' + esc(a.id) + '">Zamítnout</button>' + (a.path ? '<button class="small" data-act="openFile" data-path="' + esc(a.path) + '">Otevřít tool.json</button>' : "") + '<button class="small" data-act="autoAll">Auto (dál se neptat)</button></div></div>';
+    }
     const isCmd = a.kind === "command";
     const suggested = isCmd ? "^" + esc(a.text.split(/\\s+/).slice(0, 2).map((w) => w.replace(/[.*+?^$(){}|[\\]\\\\]/g, "\\\\$&")).join("\\\\s+")) + "\\\\b" : "";
     return '<div class="msg approval" data-approval="' + esc(a.id) + '"><div class="head">' + ic(isCmd ? "terminal" : "trash") + '<b>' + (isCmd ? "Spustit příkaz?" : "Smazat soubor?") + "</b>" + (a.cwd && a.cwd !== "." ? '<span>v ' + esc(a.cwd) + "</span>" : "") + '</div><span class="cmd">' + esc(a.text) + "</span>" +
@@ -640,6 +711,43 @@ export class SidebarView implements vscode.WebviewViewProvider {
     for (const b of $("patterns").querySelectorAll("[data-rm]")) b.onclick = () => send("removePattern", { text: b.dataset.rm, approve: b.dataset.global === "true" });
     $("exCount").textContent = list.length ? "· " + list.length : "";
   }
+  let toolsOpen = false; let toolsKey = ""; const openTools = new Set();
+  const TRUST = { ok: ["povolen", "ok"], new: ["zatím nespuštěn", ""], changed: ["změněn od povolení", "warn"], invalid: ["chyba v tool.json", "err"], builtin: ["běží v rozšíření", "ok"] };
+  const SCOPE = { global: "globální", project: "projekt", builtin: "vestavěný" };
+  const SOURCE = { model: "model", example: "příklad", user: "vy" };
+  function toolField(t, p) {
+    const at = ' data-targ="' + esc(t.name) + '" data-name="' + esc(p.name) + '"';
+    const opts = p.enum ? p.enum : p.type === "boolean" ? [true, false] : null;
+    if (opts) return "<select" + at + '><option value=""></option>' + opts.map((v) => "<option" + (v === p.default ? " selected" : "") + ">" + esc(v) + "</option>").join("") + "</select>";
+    return '<input type="text"' + at + ' placeholder="' + esc(p.type + (p.default !== undefined ? " = " + JSON.stringify(p.default) : "")) + '">';
+  }
+  function renderTools() {
+    $("toolsSheet").hidden = !toolsOpen; if (!toolsOpen) return;
+    const tools = state.tools || []; const key = JSON.stringify(tools);
+    if (key !== toolsKey) {
+      toolsKey = key;
+      $("toolList").innerHTML = tools.length ? tools.map((t) => {
+        const tr = TRUST[t.trust] || ["", ""];
+        const body = t.errors.length
+          ? '<div class="note err">' + t.errors.map(esc).join("<br>") + '</div><div class="btns"><button class="small ghost" data-tool-open="' + esc(t.path) + '">tool.json</button></div>'
+          : t.props.map((p) => '<label class="targ"><span>' + esc(p.name) + (p.required ? " *" : "") + "</span>" + toolField(t, p) + (p.description ? '<span class="sub">' + esc(p.description) + "</span>" : "") + "</label>").join("") +
+            '<div class="btns"><button class="small primary" data-tool-run="' + esc(t.name) + '">Spustit</button>' + (t.examples ? '<button class="small" data-tool-ex="' + esc(t.name) + '">Příklady (' + t.examples + ")</button>" : "") + (t.path ? '<button class="small ghost" data-tool-open="' + esc(t.path) + '">tool.json</button>' : "") + "</div>";
+        return '<details class="tool" data-tool="' + esc(t.name) + '"' + (openTools.has(t.name) ? " open" : "") + "><summary><b>" + esc(t.name) + '</b><span class="badge">' + (SCOPE[t.scope] || t.scope) + '</span><span class="badge">' + (t.readOnly ? "jen čte" : "mění data") + '</span><span class="badge ' + tr[1] + '">' + tr[0] + "</span></summary>" +
+          '<div class="sub">' + esc(t.description) + (t.output ? " → " + esc(t.output) : "") + '</div><code class="sig">' + esc(t.signature) + "</code>" + body + "</details>";
+      }).join("") : '<div class="sub">Žádné nástroje. Vytvoříte je přes <code>/tool-creator název k čemu je</code>; ukládají se do .copy-agent/tools/ (projekt) nebo ~/.copy-agent/tools/ (globální).</div>';
+      for (const d of $("toolList").querySelectorAll("details[data-tool]")) d.ontoggle = () => { if (d.open) openTools.add(d.dataset.tool); else openTools.delete(d.dataset.tool); };
+      for (const b of $("toolList").querySelectorAll("[data-tool-run]")) b.onclick = () => {
+        const vals = {}; for (const el of $("toolList").querySelectorAll('[data-targ="' + CSS.escape(b.dataset.toolRun) + '"]')) if (el.value !== "") vals[el.dataset.name] = el.value;
+        send("toolRun", { text: b.dataset.toolRun, always: JSON.stringify(vals), approve: true });
+      };
+      for (const b of $("toolList").querySelectorAll("[data-tool-ex]")) b.onclick = () => send("toolRun", { text: b.dataset.toolEx });
+      for (const b of $("toolList").querySelectorAll("[data-tool-open]")) b.onclick = () => send("openFile", { path: b.dataset.toolOpen });
+    }
+    const calls = (state.toolCalls || []).slice().reverse();
+    $("toolCalls").innerHTML = calls.length ? '<div class="sub" style="margin-top:6px"><b>Poslední volání</b></div>' + calls.map((c) => '<div class="line"><span class="txt">' + (c.status === "ok" ? ic("check") : ic("x")) + " <b>" + esc(c.tool) + '</b> <span class="cmd">' + esc(JSON.stringify(c.args)) + '</span> <span class="sub">' + esc(SOURCE[c.source] || c.source) + " · " + (c.status === "denied" ? "zamítnuto" : c.ms + " ms") + "</span></span></div>" + (c.preview ? '<pre class="prev">' + esc(c.preview) + "</pre>" : "")).join("") : "";
+  }
+  $("menuTools").onclick = () => { toolsOpen = !toolsOpen; if (toolsOpen) { toolsKey = ""; send("toolsReload"); } renderTools(); };
+  $("toolsClose").onclick = () => { toolsOpen = false; renderTools(); }; $("toolsReload").onclick = () => { toolsKey = ""; send("toolsReload"); };
   $("menuInstr").onclick = () => send("instructions"); $("menuSuggest").onclick = () => send("suggest"); $("menuTranscript").onclick = () => send("transcript"); $("menuSettings").onclick = () => send("settings");
   $("stopBtn").onclick = () => send("stop"); $("undoBtn").onclick = () => send("undo"); $("resendBtn").onclick = () => send("resend");
   document.addEventListener("click", (e) => { if (!popup.contains(e.target) && e.target !== $("slash") && e.target !== input) popup.hidden = true; });

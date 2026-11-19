@@ -1,3 +1,5 @@
+import * as bufferModule from "buffer";
+
 /**
  * Kódování a konce řádků souborů: u každého čtení se zjistí, jak soubor vypadá (BOM, UTF-8,
  * jednobajtová stránka, UTF-16, CRLF/LF), a při zápisu se to zachová. Text pro model je vždy
@@ -56,7 +58,11 @@ export function normalizeEncoding(name: string | undefined): string {
   return n;
 }
 
+/** Nativní kontrola UTF-8 (Node 18.14+); o řád rychlejší než smyčka níž. */
+const nativeIsUtf8: ((b: Uint8Array) => boolean) | undefined = (bufferModule as { isUtf8?: (b: Uint8Array) => boolean }).isUtf8;
+
 function isValidUtf8(buf: Buffer): boolean {
+  if (nativeIsUtf8) return nativeIsUtf8(buf);
   for (let i = 0; i < buf.length; ) {
     const b = buf[i];
     if (b < 0x80) {
@@ -78,6 +84,41 @@ function isValidUtf8(buf: Buffer): boolean {
   return true;
 }
 
+/** Konce řádků z bajtů (UTF-8 a jednobajtová kódování): bez dekódování celého souboru. */
+function eolOfBytes(buf: Buffer): "lf" | "crlf" {
+  let crlf = 0;
+  let lf = 0;
+  for (let i = buf.indexOf(10); i >= 0; i = buf.indexOf(10, i + 1)) {
+    if (i > 0 && buf[i - 1] === 13) crlf++;
+    else lf++;
+  }
+  return crlf > lf ? "crlf" : "lf";
+}
+
+/**
+ * Jen název kódování, bez konců řádků: pro hromadné čtení (index), kde se text stejně převádí na LF.
+ */
+export function detectEncodingName(buf: Buffer, fallback = "windows-1250"): string {
+  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) return "utf8";
+  if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) return "utf-16le";
+  if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) return "utf-16be";
+  if (buf.length >= 16) {
+    let zerosOdd = 0;
+    let zerosEven = 0;
+    const n = Math.min(buf.length, 512);
+    for (let i = 0; i < n; i++) {
+      if (buf[i] !== 0) continue;
+      if (i % 2) zerosOdd++;
+      else zerosEven++;
+    }
+    if (zerosOdd > n / 8 && zerosEven === 0) return "utf-16le";
+    if (zerosEven > n / 8 && zerosOdd === 0) return "utf-16be";
+  }
+  if (isValidUtf8(buf)) return "utf8";
+  const enc = normalizeEncoding(fallback);
+  return SINGLE_BYTE[enc] ? enc : "windows-1250";
+}
+
 export function detectEncoding(buf: Buffer, fallback = "windows-1250"): FileEncoding {
   const eolOf = (text: string): "lf" | "crlf" => {
     const crlf = (text.match(/\r\n/g) ?? []).length;
@@ -85,7 +126,7 @@ export function detectEncoding(buf: Buffer, fallback = "windows-1250"): FileEnco
     return crlf > lf ? "crlf" : "lf";
   };
   if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
-    return { encoding: "utf8", bom: true, eol: eolOf(buf.subarray(3).toString("utf8")) };
+    return { encoding: "utf8", bom: true, eol: eolOfBytes(buf) };
   }
   if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) {
     return { encoding: "utf-16le", bom: true, eol: eolOf(buf.subarray(2).toString("utf16le")) };
@@ -105,9 +146,9 @@ export function detectEncoding(buf: Buffer, fallback = "windows-1250"): FileEnco
     if (zerosOdd > n / 8 && zerosEven === 0) return { encoding: "utf-16le", bom: false, eol: eolOf(buf.toString("utf16le")) };
     if (zerosEven > n / 8 && zerosOdd === 0) return { encoding: "utf-16be", bom: false, eol: eolOf(decodeBytes(buf, "utf-16be")) };
   }
-  if (isValidUtf8(buf)) return { encoding: "utf8", bom: false, eol: eolOf(buf.toString("utf8")) };
+  if (isValidUtf8(buf)) return { encoding: "utf8", bom: false, eol: eolOfBytes(buf) };
   const enc = normalizeEncoding(fallback);
-  return { encoding: SINGLE_BYTE[enc] ? enc : "windows-1250", bom: false, eol: eolOf(decodeBytes(buf, enc)) };
+  return { encoding: SINGLE_BYTE[enc] ? enc : "windows-1250", bom: false, eol: eolOfBytes(buf) };
 }
 
 export function decodeBytes(buf: Buffer, encoding: string): string {
@@ -124,9 +165,8 @@ export function decodeBytes(buf: Buffer, encoding: string): string {
   }
   const table = SINGLE_BYTE[enc];
   if (!table) return buf.toString("utf8").replace(/^﻿/, "");
-  let out = "";
-  for (const b of buf) out += b < 0x80 ? String.fromCharCode(b) : table[b - 0x80];
-  return out;
+  // bajty 0–127 jsou ASCII; ostatní se přeloží tabulkou (přes latin1 je to řádově rychlejší než znak po znaku)
+  return buf.toString("latin1").replace(/[\x80-\xff]/g, (ch) => table[ch.charCodeAt(0) - 0x80]);
 }
 
 export function encodeText(text: string, enc: FileEncoding): Buffer {

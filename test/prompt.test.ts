@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildAgentInstructions, buildContinuePrompt, buildCorrectionPrompt, buildInitialPrompt, buildResultsPrompt, DEFAULT_OPTIONS, ProjectContext, splitPrompt } from "../src/protocol/prompt";
+import { buildAgentInstructions, buildContinuePrompt, buildCorrectionPrompt, buildInitialPrompt, buildResultsPrompt, buildSuggestPrompt, DEFAULT_OPTIONS, environmentSection, ProjectContext, renderResult, runOutputLimit, splitPrompt } from "../src/protocol/prompt";
 import { TOOLS } from "../src/protocol/schema";
 
 const ctx: ProjectContext = { workspaceName: "demo", tree: "src/a.ts\npackage.json" };
@@ -55,6 +55,62 @@ describe("prompts", () => {
     const p = buildCorrectionPrompt("s1", 2, ["No block"], { prose: "Here is what I think?", attempt: 2 });
     expect(p).toContain("<protocol-error>No block</protocol-error>");
     expect(p).toContain("correction attempt 2");
+  });
+});
+
+describe("output of a successful command", () => {
+  const out = Array.from({ length: 2000 }, (_, i) => `line ${i + 1}`).join("\n");
+  const r = { tool: "run", attrs: {}, status: "ok" as const, output: out, fullOutputPath: ".copy-agent/out/run-1-0.txt" };
+
+  it("gives the model the end of it, 15 000 characters by default, more or less by the setting", () => {
+    const def = renderResult(r, DEFAULT_OPTIONS);
+    expect(def).toContain("line 2000");
+    expect(def).not.toContain("line 100\n");
+    expect(def.length).toBeGreaterThan(14000);
+    expect(def.length).toBeLessThan(15400);
+    expect(def).toContain('Full output: <read path=".copy-agent/out/run-1-0.txt"/>');
+    expect(renderResult(r, { ...DEFAULT_OPTIONS, runOutputMaxChars: 3000 }).length).toBeLessThan(3400);
+    expect(renderResult(r, { ...DEFAULT_OPTIONS, runOutputMaxChars: 50000 })).toContain("line 1\n");
+    expect(runOutputLimit({ runOutputMaxChars: 10 })).toBe(500);
+    expect(runOutputLimit({})).toBe(15000);
+  });
+});
+
+describe("environment and script language", () => {
+  const win = { platform: "win32", python: { command: "py -3", version: "3.11.4" }, node: "20.11.0" };
+
+  it("tells the model the shell, what is installed and to write scripts in Python", () => {
+    const text = environmentSection(win).join("\n");
+    expect(text).toContain("Windows; <run> executes through cmd.exe (not PowerShell)");
+    expect(text).toContain("Python 3.11.4 is installed (run it as `py -3`)");
+    expect(text).toMatch(/SCRIPTS: .*write it in Python \(standard library only.*run with `py -3 <file>\.py`/);
+    expect(text).toContain("Do not write PowerShell (.ps1) or batch (.cmd/.bat) scripts");
+  });
+
+  it("falls back when the preferred language is not installed and says so", () => {
+    const noPython = environmentSection({ platform: "win32", node: "20.11.0" }).join("\n");
+    expect(noPython).toContain("Python is NOT installed.");
+    expect(noPython).toContain("write it in Node.js");
+    expect(noPython).toContain("(Python was preferred but is not available here)");
+    const nothing = environmentSection({ platform: "win32" }).join("\n");
+    expect(nothing).toContain("write it in PowerShell");
+    expect(nothing).not.toContain("Do not write PowerShell");
+    expect(environmentSection({ platform: "linux" }).join("\n")).toContain("write it in Bash");
+  });
+
+  it("honours the setting: another language, or no preference at all", () => {
+    expect(environmentSection(win, "node").join("\n")).toContain("write it in Node.js (built-in modules only");
+    expect(environmentSection(win, "powershell").join("\n")).toMatch(/write it in PowerShell.*\. Use another language only when/);
+    const auto = environmentSection(win, "auto").join("\n");
+    expect(auto).toContain("Python 3.11.4 is installed");
+    expect(auto).not.toContain("SCRIPTS:");
+  });
+
+  it("is part of the task context and of the suggestion prompt", () => {
+    const withEnv: ProjectContext = { ...ctx, env: { runtime: win, scripts: "python" } };
+    expect(buildInitialPrompt("s1", "task", withEnv, DEFAULT_OPTIONS)).toContain("## Environment");
+    expect(buildInitialPrompt("s1", "task", ctx, DEFAULT_OPTIONS)).not.toContain("## Environment");
+    expect(buildSuggestPrompt("s1", 4, "history", withEnv, DEFAULT_OPTIONS)).toContain("SCRIPTS: whenever the task");
   });
 });
 

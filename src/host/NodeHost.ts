@@ -1,11 +1,11 @@
 import * as fs from "fs/promises";
 import * as path from "path";
+import { WorkspaceIndex } from "../index/WorkspaceIndex";
 import { canonicalRel, resolveRel, RootFolder } from "../protocol/roots";
-import { DEFAULT_EXCLUDES, globToRegExp, parseGitignoreNames } from "../protocol/text";
 import { applyEol, decodeBytes, DEFAULT_ENCODING, detectEncoding, encodeText, FileEncoding, normalizeEncoding, toLf } from "../tools/encoding";
 import { Host, HostPolicy, RunResult } from "./Host";
 import { captureScreenshot } from "./screenshot";
-import { spawnCommand } from "./spawn";
+import { spawnCommand, workspaceEnv } from "./spawn";
 
 export const DEFAULT_POLICY: HostPolicy = {
   autoAllow: ["npm test", "npm run build", "npm run lint", "npm run typecheck", "npx tsc", "tsc", "git status", "git diff", "git log", "npx vitest run", "pytest", "python -m pytest", "python -m unittest", "cargo test", "cargo build", "go test", "go build", "dotnet build", "dotnet test"],
@@ -22,6 +22,13 @@ export interface NodeHostOptions {
   defaultEncoding?: string;
   defaultEol?: "lf" | "crlf";
   fallbackEncoding?: string;
+  /** soubor pro uložení indexu mezi spuštěními (bez něj se index staví vždy znovu) */
+  indexFile?: string;
+  /**
+   * Po kolika ms si index znovu projde disk. Výchozí 0 = při každém dotazu (tenhle host soubory nesleduje,
+   * takže jinak by neviděl změny zvenčí). Kdo změny hlásí sám přes `index.touch`, dá Infinity.
+   */
+  indexMaxAgeMs?: number;
 }
 
 /** Host nad Node API – pro CLI harness a testy. */
@@ -33,6 +40,7 @@ export class NodeHost implements Host {
   private readonly defaultEncoding: string;
   private readonly defaultEol: "lf" | "crlf";
   private readonly fallbackEncoding: string;
+  readonly index: WorkspaceIndex;
 
   constructor(
     readonly rootPath: string,
@@ -46,6 +54,12 @@ export class NodeHost implements Host {
     this.defaultEncoding = opts.defaultEncoding ?? "utf8";
     this.defaultEol = opts.defaultEol ?? "lf";
     this.fallbackEncoding = opts.fallbackEncoding ?? "windows-1250";
+    this.index = new WorkspaceIndex({
+      roots: [{ name: this.workspaceName, fsPath: this.rootPath }],
+      fallbackEncoding: () => this.fallbackEncoding,
+      storageFile: opts.indexFile,
+      maxAgeMs: opts.indexMaxAgeMs ?? 0,
+    });
   }
 
   get folders(): { name: string; path: string }[] {
@@ -96,6 +110,7 @@ export class NodeHost implements Host {
     const enc = await this.fileEncoding(rel);
     await fs.mkdir(path.dirname(p), { recursive: true });
     await fs.writeFile(p, encodeText(applyEol(text, enc.eol), enc));
+    this.index.touch(p);
   }
 
   async appendFile(rel: string, text: string): Promise<void> {
@@ -103,57 +118,44 @@ export class NodeHost implements Host {
     const enc = await this.fileEncoding(rel);
     await fs.mkdir(path.dirname(p), { recursive: true });
     await fs.appendFile(p, encodeText(applyEol(text, enc.eol), { ...enc, bom: false }));
+    this.index.touch(p);
   }
 
-  deleteFile(rel: string): Promise<void> {
-    return fs.rm(this.abs(rel), { force: true });
+  async deleteFile(rel: string): Promise<void> {
+    const p = this.abs(rel);
+    await fs.rm(p, { force: true });
+    this.index.touch(p);
   }
 
   async moveFile(from: string, to: string): Promise<void> {
+    const src = this.abs(from);
     const dest = this.abs(to);
     await fs.mkdir(path.dirname(dest), { recursive: true });
-    await fs.rename(this.abs(from), dest);
+    await fs.rename(src, dest);
+    this.index.touch(src);
+    this.index.touch(dest);
   }
 
-  async listFiles(glob: string, max = 5000): Promise<string[]> {
-    const ignore = new Set(DEFAULT_EXCLUDES);
-    try {
-      parseGitignoreNames(await fs.readFile(path.join(this.rootPath, ".gitignore"), "utf8")).forEach((n) => ignore.add(n));
-    } catch {
-      /* bez .gitignore */
-    }
-    const re = globToRegExp(glob);
-    const out: string[] = [];
-    const walk = async (dirAbs: string, relPrefix: string): Promise<void> => {
-      if (out.length >= max) return;
-      let entries;
-      try {
-        entries = await fs.readdir(dirAbs, { withFileTypes: true });
-      } catch {
-        return;
-      }
-      for (const e of entries) {
-        if (out.length >= max) return;
-        const rel = relPrefix ? `${relPrefix}/${e.name}` : e.name;
-        if (e.isDirectory()) {
-          if (ignore.has(e.name) || ignore.has(rel)) continue;
-          await walk(path.join(dirAbs, e.name), rel);
-        } else if (e.isFile()) {
-          if (ignore.has(rel)) continue;
-          if (re.test(rel)) out.push(rel);
-        }
-      }
-    };
-    await walk(this.rootPath, "");
-    return out.sort();
+  /** Soubory podle globu, seřazené; jde z indexu (ten si disk projde jen při změně). */
+  listFiles(glob: string, max = 5000): Promise<string[]> {
+    return this.index.match(glob, max);
   }
 
-  run(command: string, cwdRel: string, timeoutMs: number, probeMs?: number, signal?: AbortSignal): Promise<RunResult> {
+  async run(command: string, cwdRel: string, timeoutMs: number, probeMs?: number, signal?: AbortSignal): Promise<RunResult> {
     const cwd = cwdRel && cwdRel !== "." ? this.abs(cwdRel) : this.rootPath;
-    return spawnCommand(command, cwd, timeoutMs, probeMs, signal);
+    try {
+      return await spawnCommand(command, cwd, timeoutMs, probeMs, signal, workspaceEnv([this.rootPath]));
+    } finally {
+      // příkaz mohl soubory vytvořit, změnit i smazat
+      this.index.markStale();
+    }
+  }
+  async diagnostics(): Promise<string> {
+    return "";
   }
 
-  async diagnostics(): Promise<string> {
+  /** Bez editoru není na co čekat. */
+  async diagnosticsSettled(): Promise<string> {
     return "";
   }
 

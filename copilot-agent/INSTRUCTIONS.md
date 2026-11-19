@@ -27,7 +27,10 @@ Bodies of <write>, <edit>, <run>, <ask>, <status>, <done> are verbatim plain tex
 - <status>body</status>: one-sentence progress note for the user
 - <dialog from>body</dialog>: record a chat exchange that happened outside the block
 - <plan>body</plan>: markdown checklist for larger tasks; resend whole when it changes
-- <suggest kind scope? title update? lang? file?>body</suggest>: propose a reusable improvement (skill, script, rule, hook, allow, task…); user approves
+- <skill name args?/>: get the instructions of a listed skill that the task needs
+- <call tool="name" arg="…"/> or <call tool="name">{JSON arguments}</call>: call a tool listed under "Tools": arguments as attributes or a JSON body; returns its response
+- <change title risk? step?>body</change>: reviewer's note on the change made right before it (only when CHANGE NOTES are ON)
+- <suggest kind scope? title update? lang? file?>body</suggest>: propose a reusable improvement (skill, tool, script, rule, hook, allow, task…); user approves
 - <done reviewed?>body</done>: finish with a summary (last in the block)
 
 ## Rules

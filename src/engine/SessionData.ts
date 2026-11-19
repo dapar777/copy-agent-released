@@ -22,6 +22,9 @@ export interface TurnRecord {
   dialog?: { from: "model" | "user"; text: string }[];
   /** výsledky kola s <ask> ještě nebyly modelu odeslány (uživatel odpověděl v chatu) */
   undelivered?: boolean;
+  /** doba vykonání akcí kola: celkem a po akcích (kde se kolo zdrželo) */
+  execMs?: number;
+  timings?: { tool: string; target: string; ms: number; at?: number }[];
 }
 
 export interface SessionData {
@@ -57,7 +60,7 @@ export interface SessionData {
   bigChangeSinceReview?: boolean;
 }
 
-export type SuggestionKind = "skill" | "script" | "instructions" | "rule" | "hook" | "allow" | "setting" | "task" | "agent";
+export type SuggestionKind = "skill" | "tool" | "script" | "instructions" | "rule" | "hook" | "allow" | "setting" | "task" | "agent";
 
 export interface Suggestion {
   id: string;

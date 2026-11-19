@@ -1,5 +1,5 @@
 import { ActionResult, BLOCK, RESULTS, TOOLS } from "./schema";
-import { compactOkOutput, truncate } from "./text";
+import { compactOkOutput, OK_RUN_OUTPUT_MAX, truncate } from "./text";
 
 /**
  * Stavitel promptů. Dva cíle:
@@ -21,11 +21,15 @@ export interface PromptOptions {
   maxParts: number;
   /** maximální délka výstupu příkazu/hledání v promptu */
   resultMaxChars: number;
+  /** kolik znaků z konce výstupu ÚSPĚŠNÉHO příkazu (<run>) dostane model; výchozí 15 000 */
+  runOutputMaxChars?: number;
   /** kolik znaků má model nejvýš dát do jedné odpovědi (limit chatu na odpověď) */
   replyMaxChars: number;
   language: string;
   planMode?: boolean;
   planAuto?: boolean;
+  /** model má ke každé změně souboru rovnou připsat popis pro review (<change>) */
+  describeChanges?: boolean;
   continuousSuggest?: boolean;
   directDialog?: boolean;
   bundleUsage?: BundleUsage;
@@ -60,6 +64,10 @@ export interface ProjectContext {
   /** celá codebase přiložená k tomuto promptu jako soubor */
   initialBundle?: { file: string; files: number; chars: number; skipped: number };
   roots?: { name: string; path: string }[];
+  /** nástroje, které model volá akcí <call> (jen platné) */
+  tools?: PromptTool[];
+  /** čím jde na tomto počítači pouštět skripty a v čem je má model psát */
+  env?: { runtime: RuntimeInfo; scripts: ScriptLanguage };
   existing?: {
     hooks?: string[];
     allowPatterns?: string[];
@@ -68,6 +76,46 @@ export interface ProjectContext {
     settings?: Record<string, unknown>;
     skillBodies?: { name: string; body: string }[];
   };
+}
+
+/** Nástroj v promptu: podpis, popis, co vrací, popisy argumentů. */
+export interface PromptTool {
+  name: string;
+  signature: string;
+  description: string;
+  output?: string;
+  readOnly: boolean;
+  params?: { name: string; description: string }[];
+}
+
+/**
+ * Seznam nástrojů pro model. Každý jedním řádkem (podpis → co vrací: popis), popisy argumentů
+ * odsazeně pod ním. Kód nástroje model nevidí a nepotřebuje.
+ */
+export function toolsSection(tools: PromptTool[]): string[] {
+  if (!tools.length) return [];
+  const lines = ['## Tools (call them with <call>; you get only the response, never the code)', ""];
+  for (const t of tools) {
+    lines.push(`- ${t.signature}${t.output ? ` → ${t.output}` : ""}: ${t.description}${t.readOnly ? "" : " (changes data: the user confirms each call)"}`);
+    for (const p of t.params ?? []) lines.push(`    ${p.name}: ${p.description}`);
+  }
+  lines.push(
+    'Call: <call tool="name" arg="value"/>, or <call tool="name">{"arg": …}</call> for lists, objects and long text. Arguments are checked before the tool runs; several read-only calls in one reply run together. When a listed tool gives what you need, call it instead of writing a <run> command or reading files for the same data.',
+    "",
+  );
+  return lines;
+}
+
+/** Jazyk, ve kterém má model psát skripty; `auto` nechává volbu na něm. */
+export type ScriptLanguage = "python" | "node" | "powershell" | "bash" | "auto";
+
+export interface RuntimeInfo {
+  /** process.platform */
+  platform: string;
+  /** příkaz, kterým jde spustit Python 3 (`python`, `py -3`, `python3`), a jeho verze */
+  python?: { command: string; version: string };
+  /** verze Node.js, pokud je v PATH */
+  node?: string;
 }
 
 export interface SuggestionHistory {
@@ -107,7 +155,7 @@ export const FENCE = "````";
 function actionLines(short: boolean): string[] {
   return TOOLS.map((t) => {
     const attrs = t.attrs.map((a) => `${a.name}${a.required ? "" : "?"}`).join(" ");
-    const sig = t.hasBody ? `<${t.name}${attrs ? " " + attrs : ""}>body</${t.name}>` : `<${t.name}${attrs ? " " + attrs : ""}/>`;
+    const sig = t.signature ?? (t.hasBody ? `<${t.name}${attrs ? " " + attrs : ""}>body</${t.name}>` : `<${t.name}${attrs ? " " + attrs : ""}/>`);
     if (short) return `- ${sig}: ${t.short ?? t.doc}`;
     const docs = t.attrs.map((a) => `${a.name}${a.required ? "" : "?"}: ${a.doc}`).join("; ");
     return [`### ${sig}`, t.doc, docs ? `Attributes: ${docs}` : "", t.bodyDoc ? `Body: ${t.bodyDoc}` : "", "Example:", t.example, ""].filter((l) => l !== "").join("\n");
@@ -127,6 +175,9 @@ function formatSection(): string[] {
     `Bodies of <write>, <edit>, <run>, <ask>, <status>, <done> are verbatim plain text: write <, > and & as plain characters (never &lt;), no <![CDATA[ ]]>, no extra code fence inside a body. Use <think>…</think> inside the block for reasoning.`,
   ];
 }
+
+/** Pokyn k popisům změn; jde do úkolu, jen když je volba zapnutá (instrukce agenta v Copilotu ho nemají). */
+const CHANGE_NOTES = 'CHANGE NOTES are ON: right after every <write>, <edit>, <move> and <delete> add <change title="the change in a few words" risk="low|medium|high" step="review step">what changed and why, one to three sentences</change>. The user reads the notes next to the diff; the same step text groups changes into one step of the review, in the order the steps first appear.';
 
 function rulesSection(o: PromptOptions, short: boolean): string[] {
   const kb = Math.round(o.replyMaxChars / 1000);
@@ -172,6 +223,7 @@ function rulesSection(o: PromptOptions, short: boolean): string[] {
       'DIRECT DIALOGUE: the user reads this chat and may answer or clarify in plain text here. Ask with <ask> inside the block; when the user then writes to you directly, start your next block with <dialog from="user">their message verbatim</dialog> so the program records it.',
     );
   }
+  if (o.describeChanges) rules.push(CHANGE_NOTES);
   if (o.continuousSuggest) {
     rules.push("When you notice something reusable (a repeated instruction, a safe command, a check to run after changes, a follow-up), add a rare, concrete <suggest>; it is never applied automatically.");
   }
@@ -225,6 +277,7 @@ export function buildAgentHeader(ctx: ProjectContext, opts: PromptOptions): stri
   parts.push(
     `You are Copy Agent (see your instructions): reply with ONE fenced block <${BLOCK} turn="N" session="S">…</${BLOCK}> with the actions, batch requests, keep files valid, split long replies into parts.` +
       (opts.planMode ? " PLAN MODE is ON: the first block must contain <plan>." : "") +
+      (opts.describeChanges ? " " + CHANGE_NOTES : "") +
       ` User language: "${opts.language}".`,
     "",
   );
@@ -244,15 +297,50 @@ function extraInstructions(ctx: ProjectContext): string[] {
   return parts;
 }
 
+/**
+ * Prostředí a jazyk skriptů. Bez toho model na Windows píše skripty v PowerShellu, i když je tu Python:
+ * neví, jaký shell `<run>` používá, ani co je nainstalované. Když zvolený jazyk chybí, dostane náhradní.
+ */
+export function environmentSection(env: RuntimeInfo, scripts: ScriptLanguage = "python"): string[] {
+  const win = env.platform === "win32";
+  const facts = [`${win ? "Windows" : env.platform === "darwin" ? "macOS" : "Linux"}; <run> executes through ${win ? "cmd.exe (not PowerShell)" : "sh"}.`];
+  facts.push(env.python ? `Python ${env.python.version} is installed (run it as \`${env.python.command}\`).` : "Python is NOT installed.");
+  facts.push(env.node ? `Node.js ${env.node} is installed.` : "Node.js is NOT installed.");
+  const lines = ["## Environment", "", facts.join(" ")];
+  lines.push(
+    `FAST PATHS: the workspace is indexed, so the agent's own actions answer instantly and need no approval: <grep> (search), <glob>/<ls> (files), <read lines="A-B">, <bundle>, and the tools listed under "Tools" (where something is defined, its source, where it is used). Never do the same through <run> (${win ? "Select-String, findstr, Get-ChildItem, dir /s, Get-Content, type" : "grep, find, cat, ls -R"}): a shell command is slower, may wait for the user's approval and its output is cut.${win ? " Starting PowerShell costs about a second every time: when a shell is really needed, put all the steps into ONE <run> or one script, not several." : " When a shell is really needed, put the steps into ONE <run>."}`,
+  );
+  if (scripts === "auto") return [...lines, ""];
+
+  const shell: ScriptLanguage = win ? "powershell" : "bash";
+  const available = (l: ScriptLanguage) => (l === "python" ? !!env.python : l === "node" ? !!env.node : l === "powershell" ? win : !win);
+  const use = [scripts, "python", "node", shell].find((l) => available(l as ScriptLanguage)) as ScriptLanguage;
+  const how: Record<string, string> = {
+    python: `Python (standard library only, files read and written as UTF-8), run with \`${env.python?.command ?? "python"} <file>.py\``,
+    node: "Node.js (built-in modules only, no npm packages), run with `node <file>.js`",
+    powershell: "PowerShell, run with `powershell -ExecutionPolicy Bypass -File <file>.ps1`",
+    bash: "Bash, run with `bash <file>.sh`",
+  };
+  const names: Record<string, string> = { python: "Python", node: "Node.js", powershell: "PowerShell", bash: "Bash" };
+  const missing = use === scripts ? "" : ` (${names[scripts]} was preferred but is not available here)`;
+  const others = win && use !== "powershell" ? "Do not write PowerShell (.ps1) or batch (.cmd/.bat) scripts; use another language" : "Use another language";
+  lines.push(
+    `SCRIPTS: whenever the task, a skill you create or a <suggest kind="script"> needs a script file, write it in ${how[use]}${missing}. ${others} only when the user asks for it or the project already keeps scripts for the same job in it. One-off commands in <run> are not scripts and stay plain shell commands.`,
+    "",
+  );
+  return lines;
+}
+
 export function buildContext(ctx: ProjectContext): string {
   const parts: string[] = [];
+  if (ctx.env) parts.push(...environmentSection(ctx.env.runtime, ctx.env.scripts));
   if (ctx.roots && ctx.roots.length > 1) {
     parts.push(
       "## Workspace folders",
       "",
       `This workspace has ${ctx.roots.length} root folders. EVERY path starts with the folder name (in <read>, <write>, <edit>, <grep glob=…>, <bundle paths=…>, <run cwd=…>):`,
       ...ctx.roots.map((r) => `- ${r.name}/ → ${r.path}`),
-      `A bare path like src/x.ts is rejected. <run> without cwd runs in ${ctx.roots[0].name}/.`,
+      `A bare path like src/x.ts is rejected (unless that file exists in exactly one folder). Project instruction files are ${ctx.roots[0].name}/AGENTS.md etc. per folder; <run> without cwd runs in ${ctx.roots[0].name}/.`,
       "",
     );
   }
@@ -280,8 +368,9 @@ export function buildContext(ctx: ProjectContext): string {
   if (ctx.skills?.length) {
     parts.push("## Available skills (the user invokes them with /name; their instructions are included in the task when used)", "");
     for (const s of ctx.skills) parts.push(`- /${s.name}${s.scope ? ` (${s.scope})` : ""}: ${s.description}`);
-    parts.push("");
+    parts.push('When the task calls for one of them and its instructions are not in the task, get them with <skill name="…"/> (add args="…" for what would follow /name) and follow them in your next reply.', "");
   }
+  if (ctx.tools?.length) parts.push(...toolsSection(ctx.tools));
   return parts.join("\n");
 }
 
@@ -336,6 +425,12 @@ export function buildInitialPrompt(sessionId: string, task: string, ctx: Project
   ].join("\n");
 }
 
+/** Limit výstupu úspěšného příkazu podle nastavení (500 až 200 000 znaků). */
+export function runOutputLimit(opts: Pick<PromptOptions, "runOutputMaxChars">): number {
+  const n = Number(opts.runOutputMaxChars);
+  return Number.isFinite(n) && n > 0 ? Math.round(Math.min(200_000, Math.max(500, n))) : OK_RUN_OUTPUT_MAX;
+}
+
 export function renderResult(r: ActionResult, opts: PromptOptions): string {
   const attrs = Object.entries(r.attrs)
     .map(([k, v]) => ` ${k}="${escapeAttr(v)}"`)
@@ -348,7 +443,8 @@ export function renderResult(r: ActionResult, opts: PromptOptions): string {
   if (!r.output?.trim()) return `${head}/>`;
   const body = r.output.replace(/\r\n/g, "\n");
   // obsah souboru se nikdy neusekává uprostřed (rozdělí se na části promptu); výstup příkazu ano
-  const text = r.tool === "read" || r.tool === "bundle" ? body : r.tool === "run" && r.status === "ok" ? compactOkOutput(body, r.fullOutputPath) : truncate(body, opts.resultMaxChars, r.fullOutputPath).text;
+  // odpověď nástroje (<call>) už je zkrácená podle jeho limitu a zbytek je v souboru
+  const text = r.tool === "read" || r.tool === "bundle" || r.tool === "skill" || r.tool === "call" ? body : r.tool === "run" && r.status === "ok" ? compactOkOutput(body, r.fullOutputPath, runOutputLimit(opts)) : truncate(body, opts.resultMaxChars, r.fullOutputPath).text;
   return `${head}>\n${text}\n</result>`;
 }
 
@@ -497,6 +593,7 @@ export function buildSuggestPrompt(sessionId: string, turn: number, transcript: 
   const ex = ctx.existing ?? {};
   if (ctx.rules?.length) existing.push(`- rules already in the preamble: ${ctx.rules.length} (listed above under "Additional rules")`);
   if (ctx.skills?.length) existing.push(`- skills: ${ctx.skills.map((s) => "/" + s.name).join(", ")}`);
+  if (ctx.tools?.length) existing.push(`- tools (called with <call>): ${ctx.tools.map((t) => t.signature).join(", ")}`);
   if (ex.hooks?.length) existing.push(`- hooks: ${ex.hooks.join("; ")}`);
   if (ex.allowPatterns?.length) existing.push(`- allow patterns (regex): ${ex.allowPatterns.join(" , ")}`);
   if (ex.autoAllow?.length) existing.push(`- commands allowed by prefix: ${ex.autoAllow.join(", ")}`);
@@ -522,12 +619,15 @@ export function buildSuggestPrompt(sessionId: string, turn: number, transcript: 
     "",
     "Analyse the work history above and propose improvements for the user to approve or reject. Use ONLY <status> and <suggest> actions, then <done>. Two levels:",
     "",
-    'A) This project (scope="project"): skill (reusable instructions invoked with /name; body starts with `# name` and a one-line description), script (a REAL runnable script, see AUTOMATION), instructions (lines for AGENTS.md: conventions, commands, pitfalls seen here), hook (JSON {"match": glob, "run": command} run after matching files change), allow (regex for commands that proved safe), task (follow-up work discovered but not done).',
+    'A) This project (scope="project"): skill (reusable instructions invoked with /name; body starts with `# name` and a one-line description), tool (a function called with arguments that returns data, see TOOLS), script (a REAL runnable script, see AUTOMATION), instructions (lines for AGENTS.md: conventions, commands, pitfalls seen here), hook (JSON {"match": glob, "run": command} run after matching files change), allow (regex for commands that proved safe), task (follow-up work discovered but not done).',
     "",
     'B) The agent itself, in EVERY project (scope="global"): wasted turns, repeated mistakes, misread results, failed actions, missing verification. Propose: rule (one concise behavioural rule), setting (JSON {"key": "copyAgent.…", "value": …}), allow (regex safe anywhere), skill or instructions with scope=global, agent (feedback for the developer of the agent that cannot be applied automatically).',
     "",
     'AUTOMATION: find work done BY HAND that will repeat (command sequences, checks before a commit or release, file transformations, repeated edits of the same shape) and propose <suggest kind="script" lang="…" file="name.ext" title="…"> whose body is the COMPLETE source of a script doing the whole job in one run (real code, arguments handled, non-zero exit on failure, usage comment at the top). It is saved to .copy-agent/scripts/ and run with <run>.',
     "",
+    'TOOLS: when the history shows <run> commands (or a skill script) whose output had to be searched or parsed for the same kind of data again and again, propose <suggest kind="tool" title="tool-name"> instead: a function the model calls with arguments and gets a JSON response from. Body: the complete tool.json ({"name", "description", "inputSchema" as JSON Schema, "output", "run": "python run.py", "readOnly": true when it only reads, "examples": [{"args": {…}}]}), then a line `--- run.py ---` and the complete script (reads {"args": …} as JSON from stdin, prints the JSON response, errors to stderr with a non-zero exit).',
+    "",
+    ...(ctx.env ? environmentSection(ctx.env.runtime, ctx.env.scripts) : []),
     'Check "Already configured" first: never propose what exists or was rejected; prefer improving an existing item with update="…". At most 10 suggestions, each concrete and justified by the history (say which turn motivates it). If nothing is worth suggesting, say so in <done>.',
     "",
     `Session: ${sessionId}, turn ${turn}. ${replyReminder(turn, { language: opts.language, session: sessionId })}`,

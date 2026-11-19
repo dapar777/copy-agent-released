@@ -35,6 +35,97 @@ export async function checkWrittenFile(host: Host, rel: string): Promise<CheckIs
   return issues;
 }
 
+const PY_PROBE_MANY = [
+  "import ast, sys",
+  "bad = 0",
+  "for p in sys.argv[1:]:",
+  "    try:",
+  "        ast.parse(open(p, encoding='utf-8-sig').read(), p)",
+  "    except SyntaxError as e:",
+  "        bad = 1",
+  "        print(f'{p}\\tline {e.lineno}: {e.msg}')",
+  "    except Exception:",
+  "        pass",
+  "sys.exit(bad)",
+].join("\n");
+
+/** Syntaxe více pythonových souborů jedním spuštěním Pythonu (spuštění je to drahé, hlavně na Windows). */
+async function pyCheckMany(abs: string[]): Promise<Map<string, CheckIssue[]>> {
+  const out = new Map<string, CheckIssue[]>();
+  // příkazový řádek má na Windows omezenou délku: soubory po skupinách
+  const groups: string[][] = [[]];
+  let len = 0;
+  for (const a of abs) {
+    if (len + a.length > 20_000) {
+      groups.push([]);
+      len = 0;
+    }
+    groups[groups.length - 1].push(a);
+    len += a.length + 3;
+  }
+  await Promise.all(
+    groups
+      .filter((g) => g.length)
+      .map(async (g) => {
+        let r = await exec("python", ["-c", PY_PROBE_MANY, ...g]);
+        if (r.code === "ENOENT" || (r.code === 9009 && !r.stdout)) r = await exec("py", ["-3", "-c", PY_PROBE_MANY, ...g]);
+        if (r.code !== 1) return;
+        for (const line of r.stdout.split(/\r?\n/)) {
+          const tab = line.indexOf("\t");
+          if (tab > 0) out.set(line.slice(0, tab), [{ severity: "error", message: `Python syntax: ${line.slice(tab + 1).trim()}` }]);
+        }
+      }),
+  );
+  return out;
+}
+
+/**
+ * Kontrola více zapsaných souborů najednou (konečný stav po celém bloku akcí): soubory se čtou
+ * souběžně, pythonové se ověří jedním spuštěním Pythonu, JavaScript souběžně. Vrací nálezy podle cest;
+ * soubor bez nálezu v mapě není.
+ */
+export async function checkWrittenFiles(host: Host, rels: string[]): Promise<Map<string, CheckIssue[]>> {
+  const out = new Map<string, CheckIssue[]>();
+  const add = (rel: string, issues: CheckIssue[]) => {
+    if (issues.length) out.set(rel, [...(out.get(rel) ?? []), ...issues]);
+  };
+  const py: { rel: string; abs: string }[] = [];
+  const js: { rel: string; abs: string }[] = [];
+  await Promise.all(
+    [...new Set(rels)].map(async (rel) => {
+      let text: string;
+      try {
+        text = await host.readFile(rel);
+      } catch {
+        return; // soubor mezitím zmizel (přesun, smazání): není co kontrolovat
+      }
+      add(rel, residue(rel, text));
+      const ext = path.extname(rel).toLowerCase();
+      try {
+        if (ext === ".json") add(rel, jsonCheck(rel, text));
+        else if (ext === ".py" || ext === ".pyw") py.push({ rel, abs: host.absolutePath(rel) });
+        else if ([".js", ".mjs", ".cjs"].includes(ext)) js.push({ rel, abs: host.absolutePath(rel) });
+        else if ([".ts", ".tsx", ".mts", ".cts"].includes(ext)) add(rel, tsCheck(host.absolutePath("."), rel, text));
+      } catch {
+        /* kontrola syntaxe není k dispozici */
+      }
+    }),
+  );
+  const jobs: Promise<void>[] = [];
+  if (py.length) {
+    jobs.push(
+      pyCheckMany(py.map((f) => f.abs))
+        .then((found) => {
+          for (const f of py) add(f.rel, found.get(f.abs) ?? []);
+        })
+        .catch(() => undefined),
+    );
+  }
+  for (const f of js) jobs.push(nodeCheck(f.abs).then((issues) => add(f.rel, issues)).catch(() => undefined));
+  await Promise.all(jobs);
+  return out;
+}
+
 export function renderIssues(rel: string, issues: CheckIssue[]): string {
   const errors = issues.filter((i) => i.severity === "error");
   const head = errors.length ? `The file ${rel} was written, but it is NOT valid:` : `The file ${rel} was written; check these warnings:`;

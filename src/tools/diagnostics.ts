@@ -3,6 +3,7 @@ import { ActionResult } from "../protocol/schema";
 
 /** Po zápisu chvíli počká, aby language server stihl přepočítat (host může čekat chytřeji). */
 export async function collectDiagnosticsSettled(host: Host, onlyPath?: string, waitMs = 1200): Promise<string> {
+  if (host.diagnosticsSettled) return host.diagnosticsSettled(onlyPath);
   await new Promise((r) => setTimeout(r, waitMs));
   return host.diagnostics(onlyPath);
 }

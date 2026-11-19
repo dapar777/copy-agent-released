@@ -1,6 +1,8 @@
 import * as vscode from "vscode";
 import { DiffHunk, diffLines } from "../protocol/diff";
-import { fileExists, openDocumentWithEncoding, readText, resolveInWorkspace, tryToRel, writeText } from "../util";
+import { STATE_DIR } from "../protocol/roots";
+import { cfg, fileExists, openDocumentWithEncoding, readText, resolveInWorkspace, tryToRel, workspaceRoot, writeText } from "../util";
+import { applyRevert, buildAgentData, buildManifest, type ChangeNote, type PendingFile, type RevertEdit } from "./changeset";
 
 /**
  * Review změn po vzoru Copilotu: soubor na disku už změnu obsahuje, manažer drží „baseline“
@@ -23,6 +25,25 @@ export interface PendingHunk {
 }
 
 export const ORIG_SCHEME = "copy-agent-orig";
+/** Rozšíření Review změn: výchozí nástroj na procházení změn od agenta. */
+export const REVIEW_EXTENSION = "dapar.vscode-review";
+
+/** Stav review sady, jak ho vrací Review změn (příkaz reviewZmen.stavSady): kroky plánu a soubory s počty kusů. */
+export interface ReviewSummary {
+  kusy: number;
+  schvaleno: number;
+  maAgenta: boolean;
+  kroky: { krok: number; nazev: string; kusy: number; schvaleno: number; riziko: string }[];
+  soubory: { cesta: string; soubor: string; stav: string; plus: number; minus: number; kusy: number; schvaleno: number }[];
+}
+
+/** Co Review změn pošle, když uživatel zamítne kus: soubor a řádky, které se mají vrátit. */
+export interface RevertRequest {
+  soubor: string;
+  cely: boolean;
+  upravy: RevertEdit[];
+  popis?: string;
+}
 
 export class ReviewManager implements vscode.Disposable {
   private readonly changes = new Map<string, PendingChange>();
@@ -34,6 +55,16 @@ export class ReviewManager implements vscode.Disposable {
   /** změna původního znění (baseline) souboru: otevřený diff si levou stranu obnoví */
   private readonly origEmitter = new vscode.EventEmitter<vscode.Uri>();
   private readonly diffCache = new Map<string, { baseline: string; live: string; hunks: DiffHunk[] }>();
+  /** popisy změn od modelu (<change>), ze kterých se skládají data pro Review změn */
+  private changeNotes: ChangeNote[] = [];
+  private title = "";
+  private persistTimer: NodeJS.Timeout | undefined;
+  private persisting: Promise<void> = Promise.resolve();
+  private readonly summaryEmitter = new vscode.EventEmitter<void>();
+  /** změnil se stav review v Review změn (schválení, nový plán) */
+  readonly onDidChangeSummary = this.summaryEmitter.event;
+  /** poslední známý stav review sady; `undefined`, když Review změn není k dispozici */
+  summary: ReviewSummary | undefined;
 
   private readonly addedDeco = vscode.window.createTextEditorDecorationType({
     isWholeLine: true,
@@ -64,6 +95,114 @@ export class ReviewManager implements vscode.Disposable {
         if (rel && this.changes.has(rel)) this.refreshDecorations();
       }),
     );
+    // Schválení kusů ukládá Review změn vedle sady; podle něj se obnovuje přehled v panelu.
+    try {
+      const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(this.setDir, "uzivatel.json"));
+      const refresh = () => void this.refreshSummary();
+      this.disposables.push(watcher, watcher.onDidChange(refresh), watcher.onDidCreate(refresh), watcher.onDidDelete(refresh));
+    } catch {
+      /* bez otevřené složky není co hlídat */
+    }
+  }
+
+  /** Název úkolu: pod ním je sada vidět v Review změn. */
+  setTitle(task: string): void {
+    this.title = task;
+  }
+
+  /** Popis změny od modelu; patří k souboru a ke znění, které po akci vzniklo. */
+  addNote(note: ChangeNote): void {
+    this.changeNotes.push(note);
+    this.fire();
+  }
+
+  /** Změny se procházejí v rozšíření Review změn: je vybrané v nastavení a nainstalované. */
+  get usesReviewTool(): boolean {
+    return cfg<string>("review.tool", "review-zmen") === "review-zmen" && !!vscode.extensions.getExtension(REVIEW_EXTENSION);
+  }
+
+  /** Složka se sadou změn pro Review změn: soubor sady, znění před změnou, popisy od modelu a schválení. */
+  get setDir(): vscode.Uri {
+    return vscode.Uri.joinPath(workspaceRoot(), STATE_DIR, "review");
+  }
+
+  get setFile(): vscode.Uri {
+    return vscode.Uri.joinPath(this.setDir, "sada.json");
+  }
+
+  /** Zapíše čekající změny jako sadu pro Review změn. Volá se sama po každé změně, s malým zpožděním. */
+  persist(): Promise<void> {
+    this.persisting = this.persisting.then(() => this.writeSet()).catch(() => undefined);
+    return this.persisting;
+  }
+
+  private async writeSet(): Promise<void> {
+    const fs = vscode.workspace.fs;
+    const files: PendingFile[] = [];
+    for (const c of this.pendingFiles) {
+      const uri = resolveInWorkspace(c.path);
+      const live = c.kind !== "delete" && (await fileExists(uri)) ? await readText(uri) : undefined;
+      files.push({ path: c.path, abs: uri.fsPath, kind: c.kind, baseline: c.kind === "delete" ? c.deletedContent ?? "" : c.baseline, live });
+    }
+    const dir = this.setDir;
+    const enc = new TextEncoder();
+    const remove = async (name: string) => { try { await fs.delete(vscode.Uri.joinPath(dir, name), { recursive: true }); } catch { /* není co mazat */ } };
+    const { manifest, bases } = buildManifest(files, this.title);
+    // Nejdřív nová znění, potom úklid starých: Review změn může sadu číst právě teď.
+    await fs.createDirectory(vscode.Uri.joinPath(dir, "base"));
+    for (const b of bases) await fs.writeFile(vscode.Uri.joinPath(dir, b.name), enc.encode(b.content));
+    const keep = new Set(bases.map((b) => b.name));
+    for (const [name] of await fs.readDirectory(vscode.Uri.joinPath(dir, "base"))) if (!keep.has(`base/${name}`)) await remove(`base/${name}`);
+    const agent = buildAgentData(this.changeNotes, files, this.title);
+    if (agent) await fs.writeFile(vscode.Uri.joinPath(dir, "agent.json"), enc.encode(JSON.stringify(agent, null, 2) + "\n"));
+    else await remove("agent.json");
+    if (!files.length) {
+      // Sada je vyřízená: schválení a popisy k ní už nepatří k ničemu a příští úkol začíná načisto.
+      await remove("uzivatel.json");
+      this.changeNotes = [];
+    }
+    await fs.writeFile(this.setFile, enc.encode(JSON.stringify(manifest, null, 2) + "\n"));
+    await this.refreshSummary();
+  }
+
+  /** Zeptá se Review změn na stav review sady (kroky plánu, soubory, kolik je schváleno). */
+  async refreshSummary(): Promise<void> {
+    let next: ReviewSummary | undefined;
+    if (this.usesReviewTool && this.changes.size) {
+      try { next = await vscode.commands.executeCommand<ReviewSummary>("reviewZmen.stavSady", this.setFile.fsPath); } catch { /* starší verze rozšíření příkaz nemá */ }
+    }
+    this.summary = next;
+    this.summaryEmitter.fire();
+  }
+
+  /** Otevře změny v Review změn (volitelně rovnou u souboru). Vrací `false`, když se má použít vestavěné procházení. */
+  async openInTool(path?: string): Promise<boolean> {
+    if (!this.usesReviewTool) return false;
+    await this.persist();
+    try {
+      await vscode.commands.executeCommand("reviewZmen.sada", this.setFile.fsPath, path ? resolveInWorkspace(path).fsPath : undefined);
+      return true;
+    } catch {
+      return false; // rozšíření je starší a sady neumí
+    }
+  }
+
+  /** Uživatel v Review změn zamítl kus: řádky se vrátí do souboru a model se o tom dozví v dalším kole. */
+  async revert(req: RevertRequest): Promise<void> {
+    const path = tryToRel(vscode.Uri.file(req.soubor));
+    const c = path ? this.changes.get(path) : undefined;
+    if (!c || !path) return;
+    if (req.cely || c.kind === "delete" || !req.upravy?.length) return this.reject(path);
+    const uri = resolveInWorkspace(path);
+    const live = await readText(uri);
+    const lines = live.replace(/\r\n/g, "\n").split("\n");
+    const first = [...req.upravy].sort((a, b) => a.radek - b.radek)[0];
+    const preview = lines.slice(first.radek - 1, first.radek - 1 + Math.min(first.odebrat, 3)).join("\n");
+    const next = applyRevert(live, req.upravy);
+    await writeText(uri, next);
+    this.notes.push(`The user rejected a change in ${c.path} near line ${first.radek}${req.popis ? ` ("${req.popis}")` : ""}${preview ? `:\n${preview}${first.odebrat > 3 ? "\n…" : ""}` : ""}\nDo not re-apply it unless asked.`);
+    if (diffLines(c.baseline, next).length === 0) this.changes.delete(path);
+    this.fire();
   }
 
   register(path: string, kind: "create" | "modify", baseline: string, turn: number): void {
@@ -172,6 +311,7 @@ export class ReviewManager implements vscode.Disposable {
 
   forgetTurn(turn: number): void {
     for (const [k, c] of this.changes) if (c.turn === turn) this.changes.delete(k);
+    this.changeNotes = this.changeNotes.filter((n) => n.turn !== turn);
     this.fire();
   }
 
@@ -272,9 +412,14 @@ export class ReviewManager implements vscode.Disposable {
     // levá strana otevřených diffů (původní znění) se obnoví: po přijetí hunku, po další změně v dalším kole
     for (const p of this.changes.keys()) this.origEmitter.fire(ReviewManager.origUri(p));
     void this.refreshDecorations();
+    // Sada pro Review změn se zapisuje se zpožděním: během kola přijde změn víc za sebou.
+    clearTimeout(this.persistTimer);
+    this.persistTimer = setTimeout(() => void this.persist(), 300);
   }
 
   dispose(): void {
+    clearTimeout(this.persistTimer);
+    this.summaryEmitter.dispose();
     this.disposables.forEach((d) => d.dispose());
     this.origEmitter.dispose();
     this.codeLensEmitter.dispose();

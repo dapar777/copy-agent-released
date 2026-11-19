@@ -1,3 +1,4 @@
+import type { ChangeNote } from "../review/changeset";
 import { Host } from "../host/Host";
 import { applyHunks, parseHunks } from "../protocol/edit";
 import { STATE_DIR } from "../protocol/roots";
@@ -6,13 +7,14 @@ import { applySection } from "../protocol/section";
 import { OK_RUN_OUTPUT_MAX } from "../protocol/text";
 import { isProtectedPath } from "../safety/Policy";
 import { BundleOptions, toolBundle } from "./bundle";
-import { checkWrittenFile, renderIssues } from "./check";
+import { checkWrittenFiles, renderIssues } from "./check";
 import { toolDiagnostics } from "./diagnostics";
 import { describeEncodingEn, isPlainUtf8Lf } from "./encoding";
 import { toolGlob, toolLs, toolRead } from "./fs";
 import { toolGrep } from "./grep";
 import { toolRun } from "./run";
 import { takeScreenshot } from "./screenshot";
+import { CallTools, callInput, invokeTool, ScriptTool, signature, splitLongResponse, toolNameOfPath } from "./scripttools";
 
 /** Napojení na review změn (ve VS Code); headless běh ho nepotřebuje. */
 export interface ChangeListener {
@@ -20,6 +22,22 @@ export interface ChangeListener {
   onWillDelete(path: string, content: string, turn: number): void;
   /** volitelné schválení před zápisem; undefined = vždy povoleno */
   approve?(path: string, before: string, after: string): Promise<boolean>;
+  /** model popsal změnu, kterou právě udělal (<change>): popis patří k souboru a znění před akcí a po ní */
+  onNote?(note: ChangeNote): void;
+}
+
+/** Skill, jehož pokyny si model může vyžádat akcí <skill>. */
+export interface SkillInfo {
+  name: string;
+  body?: string;
+}
+
+/** Poslední změna souboru v bloku: k ní se váže následující <change>. */
+interface LastChange {
+  path: string;
+  kind: "create" | "modify" | "delete";
+  before: string;
+  after: string;
 }
 
 export interface SuggestionDraft {
@@ -41,8 +59,19 @@ export interface ChangedFile {
   rewritten?: boolean;
 }
 
+/** Jak dlouho akce trvala (pro přehled, kde se kolo zdrželo). */
+export interface ActionTiming {
+  tool: string;
+  target: string;
+  ms: number;
+  /** začátek akce v ms od začátku bloku (čtecí akce běží souběžně, jejich doby se překrývají) */
+  at?: number;
+}
+
 export interface RunOutcome {
   results: ActionResult[];
+  /** doba každé vykonané akce v pořadí bloku */
+  timings: ActionTiming[];
   changedFiles: boolean;
   changedPaths: string[];
   changes: ChangedFile[];
@@ -65,7 +94,9 @@ export interface RunContext {
   onEnd?: (action: Action, durationMs: number) => void;
 }
 
-const SUGGEST_KINDS = new Set(["skill", "script", "instructions", "rule", "hook", "allow", "setting", "task", "agent"]);
+const SUGGEST_KINDS = new Set(["skill", "tool", "script", "instructions", "rule", "hook", "allow", "setting", "task", "agent"]);
+/** Atributy výsledku, které argument nástroje nesmí přepsat. */
+const RESULT_ATTRS = new Set(["of", "tool", "status", "example", "check", "attached"]);
 const PARALLEL = 6;
 
 /**
@@ -78,10 +109,45 @@ export class ToolRunner {
     private readonly resultMaxChars: number,
     private readonly listener?: ChangeListener,
     private readonly bundleOptions: BundleOptions = {},
+    /** dostupné skilly; čtou se až při akci, aby platily i právě vytvořené */
+    private readonly skills?: () => SkillInfo[],
+    /** nástroje pro <call> (seznam, schvalování); bez nich <call> hlásí, že žádné nejsou */
+    private readonly tools?: CallTools,
   ) {}
 
+  private lastChange: LastChange | undefined;
+  /** kolik znaků výstupu úspěšného <run> dostane model (copyAgent.prompt.runOutputMaxChars); delší se uloží celý */
+  runOutputMaxChars = OK_RUN_OUTPUT_MAX;
+  /** nástroje, jejichž složku blok změnil: název → cesta ke složce */
+  private touchedTools = new Map<string, string>();
+  private toolCache: ScriptTool[] | undefined;
+
+  /** Seznam nástrojů; načte se znovu, když blok změnil některou jejich složku. */
+  private toolList(): ScriptTool[] {
+    return (this.toolCache ??= this.tools?.list() ?? []);
+  }
+
+  private findTool(name: string | undefined): ScriptTool | undefined {
+    const n = (name ?? "").trim().replace(/^\//, "").toLowerCase();
+    return this.toolList().find((t) => t.name === n);
+  }
+
+  /** Smí akce běžet souběžně s ostatními čtecími? <call> jen u nástroje, který jen čte. */
+  private parallel(a: Action): boolean {
+    if (a.tool === "call") {
+      const t = this.findTool(a.attrs.tool);
+      return !!t && t.readOnly && !t.errors.length;
+    }
+    return READ_ONLY_TOOLS.has(a.tool) && a.tool !== "screenshot";
+  }
+
   async runAll(actions: Action[], turn: number, ctx: RunContext = {}): Promise<RunOutcome> {
-    const outcome: RunOutcome = { results: [], changedFiles: false, changedPaths: [], changes: [], statuses: [], dialog: [], suggestions: [] };
+    const outcome: RunOutcome = { results: [], timings: [], changedFiles: false, changedPaths: [], changes: [], statuses: [], dialog: [], suggestions: [] };
+    this.lastChange = undefined;
+    this.touchedTools = new Map();
+    this.toolCache = undefined;
+    this.written = new Map();
+    this.blockStarted = Date.now();
     let i = 0;
     while (i < actions.length) {
       if (ctx.signal?.aborted) {
@@ -91,7 +157,7 @@ export class ToolRunner {
       }
       // skupina čtecích akcí (bez screenshotů, ty mění popředí) běží souběžně
       const group: Action[] = [];
-      while (i < actions.length && READ_ONLY_TOOLS.has(actions[i].tool) && actions[i].tool !== "screenshot" && group.length < PARALLEL) group.push(actions[i++]);
+      while (i < actions.length && this.parallel(actions[i]) && group.length < PARALLEL) group.push(actions[i++]);
       if (group.length > 1) {
         const results = await Promise.all(group.map((a) => this.timed(a, turn, outcome, ctx)));
         for (const r of results) if (r) outcome.results.push(r);
@@ -101,7 +167,98 @@ export class ToolRunner {
       const r = await this.timed(a, turn, outcome, ctx);
       if (r) outcome.results.push(r);
     }
+    this.checkMs = 0;
+    await this.checkWritten();
+    if (this.checkMs > 0) outcome.timings.push({ tool: "check", target: "written files", ms: this.checkMs, at: Date.now() - this.checkMs - this.blockStarted });
+    await this.tryChangedTools(actions, turn, outcome, ctx);
     return outcome;
+  }
+
+  /**
+   * Blok změnil složku nástroje a nástroj v něm nevolal: Copy Agent ho hned vyzkouší na příkladech
+   * z tool.json, aby model viděl, jestli odpovídá, jak má (nebo co je v tool.json špatně).
+   * Nástroj, který může měnit data, se sám nespouští.
+   */
+  private async tryChangedTools(actions: Action[], turn: number, outcome: RunOutcome, ctx: RunContext): Promise<void> {
+    if (!this.tools || !this.touchedTools.size) return;
+    const called = new Set(actions.filter((a) => a.tool === "call").map((a) => (a.attrs.tool ?? "").trim().replace(/^\//, "").toLowerCase()));
+    let index = actions.length;
+    for (const [name, folder] of [...this.touchedTools].sort(([a], [b]) => a.localeCompare(b))) {
+      if (called.has(name) || ctx.signal?.aborted) continue;
+      const attrs = { tool: name, check: "after change" };
+      const tool = this.findTool(name);
+      if (!tool) {
+        if ((await this.host.exists(folder)) && !(await this.host.exists(`${folder}/tool.json`))) {
+          outcome.results.push({ tool: "call", attrs, status: "error", output: `The folder ${folder} has no tool.json, so it is not a tool yet. Write ${folder}/tool.json (name, description, inputSchema, run, readOnly, examples).` });
+        }
+        continue;
+      }
+      if (tool.errors.length) {
+        outcome.results.push({ tool: "call", attrs, status: "error", output: `tool.json of the tool ${name} is invalid, the tool cannot run:\n${tool.errors.map((e) => "- " + e).join("\n")}` });
+        continue;
+      }
+      if (!tool.readOnly) {
+        outcome.results.push({ tool: "call", attrs, status: "ok", output: `The tool ${name} is saved. It was not tried automatically because it can change data (tool.json has no "readOnly": true); call it yourself when that is safe.` });
+        continue;
+      }
+      if (!tool.examples.length) {
+        outcome.results.push({ tool: "call", attrs, status: "error", output: `The tool ${name} is saved, but tool.json has no "examples" to try it on. Add at least one {"args": {…}} that works on any machine and changes nothing.` });
+        continue;
+      }
+      for (const [i, ex] of tool.examples.slice(0, 3).entries()) {
+        const a: Action = { tool: "call", attrs: { tool: name }, body: JSON.stringify(ex.args), index: index++ };
+        ctx.onStart?.(a);
+        const started = Date.now();
+        const r = await this.call(a, turn, ctx.signal, i + 1);
+        ctx.onEnd?.(a, Date.now() - started);
+        this.host.log(`call ${name} (příklad ${i + 1}) → ${r.status}${r.meta ? " " + JSON.stringify(r.meta) : ""}`);
+        outcome.results.push(r);
+      }
+    }
+  }
+
+  /** <call>: nástroj ze seznamu. Argumenty se ověří, skript se spustí a model dostane jeho odpověď. */
+  private async call(a: Action, turn: number, signal?: AbortSignal, example?: number): Promise<ActionResult> {
+    const head: Record<string, string> = { tool: (a.attrs.tool ?? "").trim() };
+    if (example) head.example = String(example);
+    const tool = this.findTool(a.attrs.tool);
+    if (!tool) {
+      const usable = this.toolList().filter((t) => !t.errors.length);
+      return { tool: "call", attrs: head, status: "error", output: `Unknown tool "${a.attrs.tool ?? ""}". ${usable.length ? `Available: ${usable.map(signature).join(", ")}.` : "No tools are available here; use other actions."}` };
+    }
+    head.tool = tool.name;
+    if (tool.errors.length) return { tool: "call", attrs: head, status: "error", output: `The tool ${tool.name} cannot run, its tool.json is invalid:\n${tool.errors.map((e) => "- " + e).join("\n")}` };
+    const parsed = callInput(a.attrs, a.body);
+    if (parsed.errors.length) return { tool: "call", attrs: head, status: "error", output: `${parsed.errors.join("; ")}. Signature: ${signature(tool)}`, meta: { rejected: "arguments" } };
+    const r = await invokeTool(this.tools!, tool, parsed.input, parsed.fromAttrs, {
+      workspace: this.host.absolutePath("."),
+      roots: this.host.folders.map((f) => f.path),
+      signal,
+      source: example ? "example" : "model",
+      host: this.host,
+    });
+    const attrs = { ...head, ...echoArgs(r.args) };
+    if (r.rejected) return { tool: "call", attrs, status: "error", output: `Arguments rejected, the tool did not run:\n${r.rejected.map((e) => "- " + e).join("\n")}\nSignature: ${signature(tool)}`, meta: { rejected: "arguments" } };
+    if (r.status === "denied" || !r.response) return { tool: "call", attrs, status: "denied", output: r.text };
+    const res = r.response;
+    const meta: Record<string, string | number> = { ms: res.durationMs };
+    if (res.status === "error") {
+      if (res.timedOut) meta.exit = "timeout";
+      else if (res.exit !== null) meta.exit = res.exit;
+      return { tool: "call", attrs, status: "error", output: res.text, meta };
+    }
+    const long = splitLongResponse(res, tool.maxChars);
+    if (!long) return { tool: "call", attrs, status: "ok", output: res.text || "(the tool printed nothing)", meta };
+    const rel = `${STATE_DIR}/out/call-${tool.name}-${turn}-${a.index}.${res.json !== undefined ? "json" : "txt"}`;
+    await this.host.writeFile(rel, long.full);
+    return {
+      tool: "call",
+      attrs,
+      status: "ok",
+      output: `${long.head}\n[… the response has ${long.full.length} characters, more than this tool's limit of ${tool.maxChars}. The complete response is in ${rel} (${long.lines} lines): read the parts you need with <read path="${rel}" lines="A-B"/>, or call the tool with narrower arguments.]`,
+      meta: { ...meta, chars: long.full.length, truncated: "true" },
+      fullOutputPath: rel,
+    };
   }
 
   /** Akce, jejichž atributy jsou cesty (ne vzory): sjednotí se na kanonický tvar před vykonáním. */
@@ -131,11 +288,15 @@ export class ToolRunner {
     const started = Date.now();
     const r = await this.runOne(a, turn, outcome, ctx.signal);
     ctx.onEnd?.(a, Date.now() - started);
+    if (!SILENT_TOOLS.has(a.tool)) {
+      const target = a.attrs.path ?? a.attrs.pattern ?? a.attrs.tool ?? a.attrs.from ?? (a.tool === "run" ? (a.body ?? "").trim().split("\n")[0].slice(0, 80) : "");
+      outcome.timings.push({ tool: a.tool, target, ms: Date.now() - started, at: started - this.blockStarted });
+    }
     if (!r) return undefined;
     if (r.meta?.duration === undefined && Date.now() - started > 1500) r.meta = { ...r.meta, duration: ((Date.now() - started) / 1000).toFixed(1) + "s" };
-    const saveAbove = a.tool === "run" && r.status === "ok" ? Math.min(this.resultMaxChars, OK_RUN_OUTPUT_MAX) : this.resultMaxChars;
-    if (r.output && r.output.length > saveAbove && a.tool !== "read" && a.tool !== "bundle") r.fullOutputPath = await this.saveFullOutput(turn, a, r.output);
-    this.host.log(`${a.tool} ${a.attrs.path ?? a.attrs.pattern ?? a.attrs.title ?? a.attrs.from ?? ""} → ${r.status}${r.meta ? " " + JSON.stringify(r.meta) : ""}`);
+    const saveAbove = a.tool === "run" && r.status === "ok" ? Math.min(this.resultMaxChars, this.runOutputMaxChars) : this.resultMaxChars;
+    if (r.output && r.output.length > saveAbove && !["read", "bundle", "skill", "call"].includes(a.tool)) r.fullOutputPath = await this.saveFullOutput(turn, a, r.output);
+    this.host.log(`${a.tool} ${a.attrs.path ?? a.attrs.pattern ?? a.attrs.title ?? a.attrs.from ?? a.attrs.tool ?? ""} → ${r.status}${r.meta ? " " + JSON.stringify(r.meta) : ""}`);
     return r;
   }
 
@@ -153,9 +314,9 @@ export class ToolRunner {
         case "diagnostics":
           return await toolDiagnostics(this.host, a.attrs);
         case "write":
-          return await this.checked(await this.write(a, turn, outcome));
+          return this.toCheck(await this.write(a, turn, outcome));
         case "edit":
-          return await this.checked(await this.edit(a, turn, outcome));
+          return this.toCheck(await this.edit(a, turn, outcome));
         case "move":
           return await this.move(a, turn, outcome);
         case "delete":
@@ -170,6 +331,20 @@ export class ToolRunner {
           return await this.plan(a, outcome);
         case "suggest":
           return this.suggest(a, outcome);
+        case "skill":
+          return this.skill(a);
+        case "call":
+          return await this.call(a, turn, signal);
+        case "change": {
+          // Popis patří ke změně těsně před ním; bez ní není k čemu ho přiřadit.
+          const c = this.lastChange;
+          if (!c) {
+            this.host.log(`<change> bez předchozí změny souboru: ${a.attrs.title ?? ""}`);
+            return undefined;
+          }
+          this.listener?.onNote?.({ ...c, turn, title: a.attrs.title ?? "", text: (a.body ?? "").trim(), risk: a.attrs.risk, step: a.attrs.step });
+          return undefined;
+        }
         case "status":
           outcome.statuses.push(a.body ?? "");
           this.host.log(`● ${a.body ?? ""}`);
@@ -209,20 +384,72 @@ export class ToolRunner {
     return this.listener?.approve ? this.listener.approve(path, before, after) : true;
   }
 
-  /** Po zápisu soubor zkontroluje; neplatný soubor = neúspěšná akce. */
-  private async checked(r: ActionResult): Promise<ActionResult> {
-    if (r.status !== "ok" || !r.attrs.path) return r;
-    const issues = await checkWrittenFile(this.host, r.attrs.path);
-    if (!issues.length) return r;
-    const bad = issues.some((i) => i.severity === "error");
-    this.host.log(`${bad ? "✗" : "⚠"} check ${r.attrs.path}: ${issues.map((i) => i.message).join("; ")}`);
-    return { ...r, status: bad ? "error" : r.status, output: [r.output, renderIssues(r.attrs.path, issues)].filter(Boolean).join("\n"), meta: { ...r.meta, [bad ? "invalid" : "warning"]: "true" } };
+  /** Zapsané soubory ke kontrole: cesta → výsledek poslední akce, která soubor zapsala. */
+  private written = new Map<string, ActionResult>();
+  private checkMs = 0;
+  private blockStarted = 0;
+
+  /** Zapamatuje zápis ke kontrole na konci bloku (viz checkWritten). */
+  private toCheck(r: ActionResult): ActionResult {
+    // zapsáno je i při částečně neúspěšném <edit> (některé hunky prošly); odmítnutý zápis soubor nezměnil
+    const wrote = r.status === "ok" || (r.tool === "edit" && r.meta?.hunks !== undefined && !String(r.meta.hunks).startsWith("0/"));
+    if (r.attrs.path && wrote) this.written.set(r.attrs.path, r);
+    return r;
+  }
+
+  /**
+   * Kontrola zapsaných souborů (zbytky protokolu, syntaxe) najednou po celém bloku: soubor se kontroluje
+   * jednou v konečném stavu, všechny souběžně a Python jedním spuštěním. Nález se připíše k výsledku
+   * poslední akce, která soubor zapsala; neplatný soubor = neúspěšná akce.
+   */
+  private async checkWritten(): Promise<void> {
+    if (!this.written.size) return;
+    const pending = this.written;
+    this.written = new Map();
+    const started = Date.now();
+    const found = await checkWrittenFiles(this.host, [...pending.keys()]);
+    this.checkMs = Date.now() - started;
+    for (const [path, issues] of found) {
+      const r = pending.get(path);
+      if (!r) continue;
+      const bad = issues.some((i) => i.severity === "error");
+      this.host.log(`${bad ? "✗" : "⚠"} check ${path}: ${issues.map((i) => i.message).join("; ")}`);
+      if (bad) r.status = "error";
+      r.output = [r.output, renderIssues(path, issues)].filter(Boolean).join("\n");
+      r.meta = { ...r.meta, [bad ? "invalid" : "warning"]: "true" };
+    }
   }
 
   private markChanged(outcome: RunOutcome, change: ChangedFile): void {
+    const toolName = toolNameOfPath(change.path);
+    if (toolName) {
+      this.touchedTools.set(toolName, change.path.replace(/\\/g, "/").replace(/(\.copy-agent\/tools\/[^/]+)\/.*$/i, "$1"));
+      this.toolCache = undefined;
+    }
     outcome.changedFiles = true;
     if (!outcome.changedPaths.includes(change.path)) outcome.changedPaths.push(change.path);
     outcome.changes.push(change);
+  }
+
+  /**
+   * Model si vyžádal pokyny skillu (uživatel ho nespustil přes /název, ale úkol ho potřebuje).
+   * Vrací celé znění, stejně jako by přišlo se zadáním.
+   */
+  private skill(a: Action): ActionResult {
+    const all = this.skills?.() ?? [];
+    const name = (a.attrs.name ?? "").trim().replace(/^\//, "").toLowerCase();
+    const found = all.find((s) => s.name.toLowerCase() === name);
+    if (!found?.body?.trim()) {
+      const names = all.filter((s) => s.body?.trim()).map((s) => "/" + s.name);
+      return { tool: "skill", attrs: a.attrs, status: "error", output: `Unknown skill "${a.attrs.name ?? ""}". ${names.length ? `Available: ${names.join(", ")}.` : "No skills are available."}` };
+    }
+    const args = (a.attrs.args ?? "").trim();
+    return {
+      tool: "skill",
+      attrs: a.attrs,
+      status: "ok",
+      output: `Instructions of the skill /${found.name}. Follow them now, as if the user had written: /${found.name}${args ? " " + args : ""}\n\n${found.body.trim()}`,
+    };
   }
 
   private async write(a: Action, turn: number, outcome: RunOutcome): Promise<ActionResult> {
@@ -243,6 +470,7 @@ export class ToolRunner {
     this.listener?.onWillChange(path, exists ? "modify" : "create", baseline, turn);
     const enc = await this.host.fileEncoding(path);
     await this.host.writeFile(path, content);
+    this.lastChange = { path, kind: exists ? "modify" : "create", before: baseline, after: content };
     const lines = content.split("\n").length;
     this.markChanged(outcome, { path, kind: exists ? "modify" : "create", lines, rewritten: exists });
     const meta: Record<string, string | number> = { [exists ? "overwritten" : "created"]: `${lines} lines` };
@@ -282,6 +510,7 @@ export class ToolRunner {
       this.listener?.onWillChange(path, "modify", baseline, turn);
       const enc = await this.host.fileEncoding(path);
       await this.host.writeFile(path, sec.content);
+      this.lastChange = { path, kind: "modify", before: baseline, after: sec.content };
       this.markChanged(outcome, { path, kind: "modify", lines: sec.content.split("\n").length });
       const r = sec.replaced!;
       const what = mode === "replace" ? `Section "${r.heading}" (lines ${r.from}-${r.to}) replaced.` : `New section inserted ${mode} "${r.heading}" (now lines ${r.from}-${r.to}).`;
@@ -298,6 +527,7 @@ export class ToolRunner {
     this.listener?.onWillChange(path, "modify", baseline, turn);
     const enc = await this.host.fileEncoding(path);
     await this.host.writeFile(path, res.content);
+    this.lastChange = { path, kind: "modify", before: baseline, after: res.content };
     this.markChanged(outcome, { path, kind: "modify", lines: res.content.split("\n").length });
     const failText = res.failures.map((f) => `Hunk ${f.hunk} FAILED (others applied): ${f.reason}`).join("\n\n");
     const output = [failText, notes].filter(Boolean).join("\n\n");
@@ -315,6 +545,7 @@ export class ToolRunner {
     this.listener?.onWillDelete(from, content, turn);
     this.listener?.onWillChange(to, "create", "", turn);
     await this.host.moveFile(from, to);
+    this.lastChange = { path: to, kind: "create", before: "", after: content };
     this.markChanged(outcome, { path: from, kind: "delete" });
     this.markChanged(outcome, { path: to, kind: "move" });
     return { tool: "move", attrs: a.attrs, status: "ok" };
@@ -329,6 +560,7 @@ export class ToolRunner {
     const content = await this.host.readFile(path);
     this.listener?.onWillDelete(path, content, turn);
     await this.host.deleteFile(path);
+    this.lastChange = { path, kind: "delete", before: content, after: "" };
     this.markChanged(outcome, { path, kind: "delete" });
     return { tool: "delete", attrs: a.attrs, status: "ok" };
   }
@@ -363,6 +595,17 @@ export class ToolRunner {
       return "";
     }
   }
+}
+
+/** Krátké textové a číselné argumenty volání se zopakují ve výsledku, aby šly výsledky přiřadit k voláním. */
+function echoArgs(args: Record<string, unknown>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(args)) {
+    if (Object.keys(out).length >= 4) break;
+    if (RESULT_ATTRS.has(k) || !/^[a-zA-Z_][\w-]*$/.test(k)) continue;
+    if (typeof v === "string" ? v.length <= 80 && !v.includes("\n") : typeof v === "number" || typeof v === "boolean") out[k] = String(v);
+  }
+  return out;
 }
 
 /** Tělo <write>, které není obsah souboru, ale odkaz („viz výše“, „beze změny“, „…“). */

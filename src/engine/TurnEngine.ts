@@ -11,10 +11,13 @@ import {
   documentPathInTask,
   ProjectContext,
   PromptOptions,
+  runOutputLimit,
+  RuntimeInfo,
+  ScriptLanguage,
   SuggestionHistory,
   summarizeTurn,
 } from "../protocol/prompt";
-import { STATE_DIR } from "../protocol/roots";
+import { INSTRUCTION_FILE_NAMES, STATE_DIR } from "../protocol/roots";
 import { Action, ActionResult, ParsedReply, REMARK_TOOLS } from "../protocol/schema";
 import { nowId } from "../protocol/text";
 import { readGlobalInstructions, readGlobalRules } from "../skills/GlobalConfig";
@@ -23,13 +26,15 @@ import { toolBundle } from "../tools/bundle";
 import { collectAutoContext, renderAutoContext } from "../tools/context";
 import { collectDiagnosticsSettled } from "../tools/diagnostics";
 import { renderTree } from "../tools/fs";
-import { ChangeListener, looksLikePlaceholder, PLAN_FILE, RunContext, RunOutcome, ToolRunner } from "../tools/runner";
+import { SkillInfo, ChangeListener, looksLikePlaceholder, PLAN_FILE, RunContext, RunOutcome, ToolRunner } from "../tools/runner";
+import { runtimeInfo } from "../tools/runtime";
+import { CallTools, promptTools } from "../tools/scripttools";
 import { SessionData, Suggestion, TurnRecord } from "./SessionData";
 
 /** Projektová pravidla chování agenta (jedno na řádek). */
 export const RULES_FILE = `${STATE_DIR}/rules.md`;
 /** Soubory s instrukcemi projektu (první existující se použije). */
-export const INSTRUCTION_FILES = ["AGENTS.md", "COPY-AGENT.md"];
+export const INSTRUCTION_FILES = INSTRUCTION_FILE_NAMES;
 
 /** Ořízne chatové věty kolem dokumentu napsaného do chatu (úvod před prvním nadpisem, závěrečná nabídka). */
 export function trimChatter(body: string): { body: string; dropped: string[] } {
@@ -67,6 +72,8 @@ export type StepResult =
 
 export interface EngineOptions extends PromptOptions {
   treeMaxEntries: number;
+  /** dostupné skilly pro akci <skill> */
+  skills?: () => SkillInfo[];
   /** automatický kontext k úvodnímu promptu */
   autoContext?: boolean;
   autoContextMaxChars?: number;
@@ -74,6 +81,12 @@ export interface EngineOptions extends PromptOptions {
   bundleInline?: boolean;
   /** celá codebase jako příloha úvodního promptu (bez limitu velikosti); výchozí ano */
   fullContext?: boolean;
+  /** jazyk, ve kterém má model psát skripty; výchozí Python */
+  scriptLanguage?: ScriptLanguage;
+  /** čím jde pouštět skripty; výchozí je zjištění na tomto počítači (testy si dosadí vlastní) */
+  runtime?: () => Promise<RuntimeInfo>;
+  /** nástroje, které model volá akcí <call> */
+  tools?: CallTools;
 }
 
 export interface InitialBundle {
@@ -96,7 +109,8 @@ export class TurnEngine {
     private readonly opts: EngineOptions,
     listener?: ChangeListener,
   ) {
-    this.runner = new ToolRunner(host, opts.resultMaxChars, listener, { inline: opts.bundleInline ?? true });
+    this.runner = new ToolRunner(host, opts.resultMaxChars, listener, { inline: opts.bundleInline ?? true }, opts.skills, opts.tools);
+    this.runner.runOutputMaxChars = runOutputLimit(opts);
   }
 
   /** Před novým úkolem odloží plán předchozího sezení (hotový smaže, rozpracovaný archivuje). */
@@ -110,6 +124,9 @@ export class TurnEngine {
 
   async gatherContext(active?: ProjectContext["active"], skills?: ProjectContext["skills"], task?: string, excludeAuto: string[] = []): Promise<ProjectContext> {
     const ctx: ProjectContext = { workspaceName: this.host.workspaceName, tree: await renderTree(this.host, this.opts.treeMaxEntries) };
+    ctx.env = { runtime: await (this.opts.runtime ?? runtimeInfo)(), scripts: this.opts.scriptLanguage ?? "python" };
+    const tools = promptTools(this.opts.tools?.list() ?? []);
+    if (tools.length) ctx.tools = tools;
     const folders = this.host.folders;
     if (folders.length > 1) {
       ctx.roots = folders;
@@ -437,6 +454,8 @@ export class TurnEngine {
       status: statusNote,
       errors: parsed.errors.length ? parsed.errors : undefined,
       dialog: outcome.dialog.length ? outcome.dialog : undefined,
+      execMs: Date.now() - startedAt,
+      timings: outcome.timings,
     };
     const prev = session.history[session.history.length - 1];
     const carried = prev?.undelivered ? prev.results.filter((r) => r.tool !== "ask") : [];
@@ -493,7 +512,12 @@ export class TurnEngine {
       return { kind: "ask", question: outcome.question, options: outcome.questionOptions, multi: outcome.questionMulti, record };
     }
 
+    const diagStarted = Date.now();
     const diagnostics = outcome.changedFiles ? await collectDiagnosticsSettled(this.host) : undefined;
+    if (outcome.changedFiles) {
+      record.timings = [...(record.timings ?? []), { tool: "diagnostics", target: "after changes", ms: Date.now() - diagStarted }];
+      record.execMs = Date.now() - startedAt;
+    }
     const prompt = buildResultsPrompt(
       session.id,
       session.turn,
